@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Entornos virtuales
+venv/
+env/
+.env/
+.venv/
+
+# Variables de entorno / secretos (nunca subir API keys)
+.env
+*.env
+secrets.py
+
+# Excel generado (datos dinámicos, no necesario en repo)
+crypto_signals.xlsx
+
+# Backtest outputs (archivos generados)
+backtest_trades_*.csv
+backtest_resumen_*.csv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Windows
+Thumbs.db
+desktop.ini

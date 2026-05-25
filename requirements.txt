@@ -1,0 +1,6 @@
+requests
+pandas
+numpy
+openpyxl
+schedule
+python-dotenv
