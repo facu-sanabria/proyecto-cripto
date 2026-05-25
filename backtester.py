@@ -244,26 +244,25 @@ def run_backtest(
     is_btc:          bool              = False,
     use_trailing:    bool              = False,
     trade_from:      datetime | None   = None,
+    use_breakeven:   bool              = False,
+    use_macd_exit:   bool              = False,
 ) -> dict:
     """
     Simula las operaciones del bot sobre datos históricos.
 
     Lógica v3:
-    - Trailing Stop: opcional (default OFF — TP fijo mejor para crypto volátil)
-    - Fear & Greed histórico: ajuste menor (±10 max) al score por contexto emocional
-    - ADX hard block en score_crypto() → bloquea mercados laterales sin tendencia
-    - Bear market hard block → no comprar cuando EMA50 y precio bajo EMA200
-    - trade_from: no entrar posiciones antes de esta fecha (para datos de warmup)
+    - Trailing Stop:    opcional — TP fijo mejor para crypto volátil
+    - Breakeven Stop:   cuando trade sube +1.5×ATR, SL se mueve a precio entrada
+                        → el peor caso pasa de -1.5 ATR a 0% (breakeven)
+    - MACD Exit:        salida cuando MACD cruza a negativo MIENTRAS el trade
+                        está en profit → deja correr tendencias, no las corta en TP fijo
+    - F&G histórico:    ajuste ±10 max al score por contexto emocional
+    - ADX hard block:   bloquea mercados laterales (ya en score_crypto)
+    - trade_from:       no entrar antes de esta fecha (warmup de indicadores)
 
     Args:
-        df:              OHLCV en timeframe de trading (4h por defecto)
-        initial_capital: Capital inicial en USDT
-        threshold:       Score mínimo para entrar (default 40 = BUY calificado)
-        fg_history:      Serie histórica Fear & Greed (ajuste de contexto ±10 max)
-        symbol:          Símbolo del activo (para logs)
-        is_btc:          Si es Bitcoin (ajusta filtros de dominance en F&G)
-        use_trailing:    Activar trailing stop (opt-in con --trailing)
-        trade_from:      Solo entrar posiciones a partir de esta fecha (warmup pre-fecha)
+        use_breakeven:  Mover SL a breakeven cuando precio sube +1.5×ATR
+        use_macd_exit:  Salir cuando MACD cruza negativo estando en profit
     """
     trades       = []
     equity_curve = []
@@ -273,15 +272,15 @@ def run_backtest(
     in_position          = False
     entry_price          = 0.0
     stop_loss            = 0.0
-    take_profit          = 0.0   # solo referencia, trailing stop lo reemplaza
+    take_profit          = 0.0
     entry_date           = None
     entry_idx            = 0
     entry_atr            = 0.0
     entry_score          = 0
     entry_signal         = ""
     highest_since_entry  = 0.0   # para trailing stop
+    breakeven_activated  = False  # para breakeven stop
 
-    # Context de mercado vacío (para cuando no hay datos de context)
     empty_ctx = {"fear_greed": {}, "btc_dominance": {}, "funding_rates": {}}
 
     total_rows = len(df)
@@ -299,15 +298,17 @@ def run_backtest(
         high  = row["high"]
         low   = row["low"]
 
+        macd_hist      = ind["macd_hist"]
+        macd_hist_prev = ind.get("macd_hist_prev", macd_hist)
+
         # ── Ajuste por Fear & Greed histórico ─────────────────────────────────
         if fg_history is not None:
             fg_adj, _ = market_context_score_adjustment(
                 symbol, is_btc, empty_ctx, date=date, fg_history=fg_history
             )
             score = max(-100, min(100, score + fg_adj))
-            # Recalcular señal con nuevo score
-            if score >= 60:   signal = "STRONG BUY"
-            elif score >= 25: signal = "BUY"
+            if score >= 60:    signal = "STRONG BUY"
+            elif score >= 25:  signal = "BUY"
             elif score <= -60: signal = "STRONG SELL"
             elif score <= -25: signal = "SELL"
             else:              signal = "NEUTRAL"
@@ -318,7 +319,17 @@ def run_backtest(
                 highest_since_entry = close
             new_trailing_sl = highest_since_entry - SL_MULTIPLIER * entry_atr
             if new_trailing_sl > stop_loss:
-                stop_loss = new_trailing_sl   # el SL solo sube, nunca baja
+                stop_loss = new_trailing_sl
+
+        # ── Breakeven Stop: SL → precio entrada cuando trade sube +1.5×ATR ────
+        # Una vez el trade está en zona de ganancia clara, el riesgo real = 0.
+        # Esto elimina las pérdidas en trades que "casi ganaron".
+        if in_position and use_breakeven and not breakeven_activated:
+            if high >= entry_price + 1.5 * entry_atr:
+                new_sl = entry_price  # mover SL a precio de entrada (breakeven)
+                if new_sl > stop_loss:
+                    stop_loss = new_sl
+                breakeven_activated = True
 
         # ── Condiciones de salida ──────────────────────────────────────────────
         if in_position:
@@ -327,14 +338,23 @@ def run_backtest(
             exit_reason  = None
 
             if low <= stop_loss:
-                exit_price  = max(low, stop_loss)  # slippage en gap down
+                exit_price  = max(low, stop_loss)
                 exit_reason = "Trailing Stop" if use_trailing else "Stop-Loss"
+
             elif not use_trailing and high >= take_profit:
                 exit_price  = take_profit
                 exit_reason = "Take-Profit"
+
+            elif use_macd_exit and macd_hist < 0 and macd_hist_prev >= 0 and close > entry_price:
+                # MACD acaba de cruzar a negativo y el trade está en profit.
+                # Señal de que el momentum alcista terminó → salir y conservar ganancia.
+                exit_price  = close
+                exit_reason = "MACD exit (ganancia asegurada)"
+
             elif signal in ("SELL", "STRONG SELL") and score <= -threshold:
                 exit_price  = close
                 exit_reason = "Señal SELL"
+
             elif hold_candles >= MAX_HOLD_CANDLES:
                 exit_price  = close
                 exit_reason = "Timeout"
@@ -362,11 +382,11 @@ def run_backtest(
                     "ganadora":       pnl_usdt > 0,
                 })
 
-                in_position = False
+                in_position         = False
+                breakeven_activated = False
 
         # ── Señal de entrada ───────────────────────────────────────────────────
         elif score >= threshold:
-            # No entrar antes de trade_from (período de calentamiento de indicadores)
             if trade_from is not None and date < trade_from:
                 equity_curve.append({"fecha": date, "capital": round(capital, 4)})
                 continue
@@ -376,6 +396,7 @@ def run_backtest(
             stop_loss   = close - SL_MULTIPLIER * atr
             take_profit = close + TP_MULTIPLIER * atr
             highest_since_entry = close
+            breakeven_activated = False
 
             in_position  = True
             entry_date   = date
@@ -593,14 +614,20 @@ def main():
     parser.add_argument("--assets",     type=str,   default="crypto",
                         choices=["crypto", "stocks", "all"],
                         help="Qué activos analizar: crypto, stocks, all (default: crypto)")
-    parser.add_argument("--trailing",   action="store_true",
+    parser.add_argument("--trailing",    action="store_true",
                         help="Activar trailing stop (default: TP fijo, mejor para crypto)")
-    parser.add_argument("--no-fg",      action="store_true",
+    parser.add_argument("--breakeven",   action="store_true",
+                        help="Mover SL a breakeven cuando trade sube +1.5×ATR")
+    parser.add_argument("--macd-exit",   action="store_true",
+                        help="Salir cuando MACD cruza negativo estando en profit (deja correr tendencias)")
+    parser.add_argument("--no-fg",       action="store_true",
                         help="Desactivar filtro Fear & Greed histórico")
     args = parser.parse_args()
 
-    use_trailing = args.trailing  # default False (TP fijo mejor para crypto)
-    use_fg       = not args.no_fg
+    use_trailing   = args.trailing
+    use_breakeven  = args.breakeven
+    use_macd_exit  = args.macd_exit
+    use_fg         = not args.no_fg
 
     # ── Parsear fechas ──────────────────────────────────────────────────────────
     start_dt = None
@@ -643,8 +670,10 @@ def main():
         print("✓" if fg_history is not None else "✗ (usando neutral)")
 
     print(f"\n🔍 Período: {period_label} | Assets: {args.assets}")
-    print(f"   Trailing stop: {'ON' if use_trailing else 'OFF'} | "
-          f"F&G filter: {'ON' if use_fg and fg_history is not None else 'OFF'}")
+    print(f"   Trailing: {'ON' if use_trailing else 'OFF'} | "
+          f"Breakeven: {'ON' if use_breakeven else 'OFF'} | "
+          f"MACD exit: {'ON' if use_macd_exit else 'OFF'} | "
+          f"F&G: {'ON' if use_fg and fg_history is not None else 'OFF'}")
     print(f"   Capital: ${args.capital:,.2f} | Score mínimo: {args.threshold}\n")
 
     all_trades = []
@@ -690,14 +719,16 @@ def main():
         print(f"{len(df)} velas. Simulando...", end=" ", flush=True)
 
         result = run_backtest(
-            df            = df,
+            df             = df,
             initial_capital = args.capital,
-            threshold     = args.threshold,
-            fg_history    = fg_history if use_fg else None,
-            symbol        = symbol,
-            is_btc        = is_btc,
-            use_trailing  = use_trailing,
-            trade_from    = start_dt,   # no entrar antes de la fecha de inicio pedida
+            threshold      = args.threshold,
+            fg_history     = fg_history if use_fg else None,
+            symbol         = symbol,
+            is_btc         = is_btc,
+            use_trailing   = use_trailing,
+            trade_from     = start_dt,
+            use_breakeven  = use_breakeven,
+            use_macd_exit  = use_macd_exit,
         )
 
         for trade in result["trades"]:
