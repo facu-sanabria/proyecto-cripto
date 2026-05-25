@@ -239,10 +239,11 @@ def run_backtest(
     df:              pd.DataFrame,
     initial_capital: float,
     threshold:       int,
-    fg_history:      pd.Series | None = None,
-    symbol:          str              = "",
-    is_btc:          bool             = False,
-    use_trailing:    bool             = False,
+    fg_history:      pd.Series | None  = None,
+    symbol:          str               = "",
+    is_btc:          bool              = False,
+    use_trailing:    bool              = False,
+    trade_from:      datetime | None   = None,
 ) -> dict:
     """
     Simula las operaciones del bot sobre datos históricos.
@@ -252,6 +253,7 @@ def run_backtest(
     - Fear & Greed histórico: ajuste menor (±10 max) al score por contexto emocional
     - ADX hard block en score_crypto() → bloquea mercados laterales sin tendencia
     - Bear market hard block → no comprar cuando EMA50 y precio bajo EMA200
+    - trade_from: no entrar posiciones antes de esta fecha (para datos de warmup)
 
     Args:
         df:              OHLCV en timeframe de trading (4h por defecto)
@@ -261,6 +263,7 @@ def run_backtest(
         symbol:          Símbolo del activo (para logs)
         is_btc:          Si es Bitcoin (ajusta filtros de dominance en F&G)
         use_trailing:    Activar trailing stop (opt-in con --trailing)
+        trade_from:      Solo entrar posiciones a partir de esta fecha (warmup pre-fecha)
     """
     trades       = []
     equity_curve = []
@@ -363,6 +366,11 @@ def run_backtest(
 
         # ── Señal de entrada ───────────────────────────────────────────────────
         elif score >= threshold:
+            # No entrar antes de trade_from (período de calentamiento de indicadores)
+            if trade_from is not None and date < trade_from:
+                equity_curve.append({"fecha": date, "capital": round(capital, 4)})
+                continue
+
             atr         = ind["atr"]
             entry_price = close
             stop_loss   = close - SL_MULTIPLIER * atr
@@ -689,6 +697,7 @@ def main():
             symbol        = symbol,
             is_btc        = is_btc,
             use_trailing  = use_trailing,
+            trade_from    = start_dt,   # no entrar antes de la fecha de inicio pedida
         )
 
         for trade in result["trades"]:
