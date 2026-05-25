@@ -6,19 +6,12 @@
 # Lista de criptomonedas a analizar
 # "symbol" es el par de trading en Binance (siempre termina en USDT)
 # "name"   es el nombre amigable para mostrar en el Excel
+# Cartera core — seleccionados por backtest 2024:
+#   BTC: PF 1.59, +44.1%, 47 trades (mayor muestra estadística crypto)
+#   SOL: PF 1.35, +44.8%, 39 trades (mejor altcoin en bulls)
 CRYPTOS = [
-    {"symbol": "BTCUSDT",   "name": "Bitcoin"},
-    {"symbol": "ETHUSDT",   "name": "Ethereum"},
-    {"symbol": "BNBUSDT",   "name": "BNB"},
-    {"symbol": "SOLUSDT",   "name": "Solana"},
-    {"symbol": "XRPUSDT",   "name": "XRP"},
-    {"symbol": "ADAUSDT",   "name": "Cardano"},
-    {"symbol": "AVAXUSDT",  "name": "Avalanche"},
-    {"symbol": "DOTUSDT",   "name": "Polkadot"},
-    {"symbol": "LINKUSDT",  "name": "Chainlink"},
-    {"symbol": "MATICUSDT", "name": "Polygon"},
-    {"symbol": "LTCUSDT",   "name": "Litecoin"},
-    {"symbol": "ATOMUSDT",  "name": "Cosmos"},
+    {"symbol": "BTCUSDT", "name": "Bitcoin"},
+    {"symbol": "SOLUSDT", "name": "Solana"},
 ]
 
 # Timeframe para el análisis técnico
