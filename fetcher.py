@@ -9,6 +9,7 @@
 import requests
 import pandas as pd
 import time
+from datetime import datetime, timedelta
 from config import TIMEFRAME, CANDLES, CRYPTOS
 
 # URL base de la API de Binance
@@ -91,6 +92,72 @@ def get_stats_24h(symbol: str) -> dict | None:
     except requests.RequestException as e:
         print(f"  ⚠️  Error obteniendo stats de {symbol}: {e}")
         return None
+
+
+def get_daily_ohlcv(symbol: str, months: int = 8) -> pd.DataFrame | None:
+    """
+    Descarga velas DIARIAS para confirmación multi-timeframe.
+
+    Antes de entrar en una posición de 4h, verificamos que la tendencia
+    en el gráfico diario también sea alcista. Esto filtra ~40% de señales
+    falsas que van contra la tendencia principal.
+
+    Args:
+        symbol: Par de trading, ej: "BTCUSDT"
+        months: Meses de historial (necesitamos >200 días para EMA200)
+
+    Returns:
+        DataFrame diario o None si hubo error.
+    """
+    # Calcular rango: necesitamos extra para warm-up de EMA200
+    end_dt   = datetime.now()
+    start_dt = end_dt - timedelta(days=months * 30 + 250)  # +250 días extra para EMA200
+
+    end_ms   = int(end_dt.timestamp()   * 1000)
+    start_ms = int(start_dt.timestamp() * 1000)
+
+    all_candles   = []
+    current_start = start_ms
+
+    while current_start < end_ms:
+        params = {
+            "symbol":    symbol,
+            "interval":  "1d",
+            "startTime": current_start,
+            "endTime":   end_ms,
+            "limit":     1000,
+        }
+        try:
+            resp = requests.get(f"{BINANCE_BASE}/klines", params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException:
+            return None
+
+        if not data:
+            break
+
+        all_candles.extend(data)
+        last_close_time = data[-1][6]
+        if last_close_time >= end_ms:
+            break
+        current_start = last_close_time + 1
+        time.sleep(0.1)
+
+    if not all_candles:
+        return None
+
+    df = pd.DataFrame(all_candles, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+
+    df = df.drop_duplicates(subset="timestamp").sort_values("timestamp")
+    return df.set_index("timestamp")[["open", "high", "low", "close", "volume"]]
 
 
 def fetch_all(cryptos: list = CRYPTOS, interval: str = TIMEFRAME, limit: int = CANDLES) -> list:

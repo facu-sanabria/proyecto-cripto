@@ -13,13 +13,18 @@
 #   4. Ejecutar:  python notifier.py  (envía mensaje de prueba)
 # ══════════════════════════════════════════════════════════════════════════════
 
+import sys
 import os
 import time
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
 
-load_dotenv()
+# Fix encoding Windows — necesario para emojis en consola
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+load_dotenv(override=True)  # override=True fuerza recarga aunque ya estén en env
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -217,5 +222,11 @@ def test_connection() -> bool:
 # ─── Ejecutar como script (test) ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Probando conexión con Telegram...")
+    print("Probando conexion con Telegram...")
+    print(f"  Token cargado:   {'SI' if TELEGRAM_TOKEN else 'NO — verificar .env'}")
+    print(f"  Chat ID cargado: {'SI' if TELEGRAM_CHAT_ID else 'NO — verificar .env'}")
+    if TELEGRAM_TOKEN:
+        partes = TELEGRAM_TOKEN.split(":")
+        print(f"  Token formato:   {'OK (num:letras)' if len(partes) == 2 else 'MAL — debe ser 123456:ABC-xxx'}")
+    print()
     test_connection()

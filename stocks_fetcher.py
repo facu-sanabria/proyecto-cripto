@@ -16,6 +16,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import time
+import threading
 
 # ─── Lista de acciones y ETFs a analizar ─────────────────────────────────────
 
@@ -76,18 +77,37 @@ def get_stock_ohlcv(
             interval = "1d"
 
     try:
-        ticker = yf.Ticker(symbol)
+        import requests as _req
+        from requests.adapters import HTTPAdapter as _HTTPAdapter
+
+        # HTTPAdapter con timeout real en el socket — el único timeout que
+        # funciona en Python sin multiprocessing. Si Yahoo no responde en
+        # CONNECT_TIMEOUT segundos, lanza requests.exceptions.Timeout.
+        CONNECT_TIMEOUT = 15  # segundos para establecer conexión
+        READ_TIMEOUT    = 20  # segundos esperando respuesta
+
+        class _TimeoutAdapter(_HTTPAdapter):
+            def send(self, *args, **kwargs):
+                kwargs["timeout"] = (CONNECT_TIMEOUT, READ_TIMEOUT)
+                return super().send(*args, **kwargs)
+
+        session = _req.Session()
+        session.mount("https://", _TimeoutAdapter())
+        session.mount("http://",  _TimeoutAdapter())
+
+        ticker = yf.Ticker(symbol, session=session)
 
         if start_dt and end_dt:
-            df = ticker.history(start=start_dt, end=end_dt, interval=interval)
+            yf_kwargs = dict(start=start_dt, end=end_dt, interval=interval)
         elif start_dt:
-            df = ticker.history(start=start_dt, interval=interval)
+            yf_kwargs = dict(start=start_dt, interval=interval)
         else:
-            # Calcular período desde meses
             period_map = {1: "1mo", 2: "2mo", 3: "3mo", 6: "6mo",
                           12: "1y", 24: "2y", 36: "3y", 60: "5y"}
             period = next((v for k, v in sorted(period_map.items()) if months <= k), "5y")
-            df = ticker.history(period=period, interval=interval)
+            yf_kwargs = dict(period=period, interval=interval)
+
+        df = ticker.history(**yf_kwargs)
 
         if df.empty:
             return None
@@ -150,6 +170,39 @@ def get_stock_stats(symbol: str) -> dict | None:
         return None
 
 
+_TIMED_OUT = object()   # sentinel para distinguir "timeout" de "None real"
+
+
+def _run_with_timeout(fn, args=(), kwargs=None, timeout_sec=45):
+    """
+    Llama fn(*args, **kwargs) en un daemon thread.
+    - Retorna el resultado si termina a tiempo.
+    - Retorna _TIMED_OUT si se pasa de timeout_sec (thread abandona en bg).
+    - Relanza la excepción si fn falla internamente.
+    Daemon thread = nunca bloquea el proceso principal.
+    """
+    if kwargs is None:
+        kwargs = {}
+    result   = [None]
+    exc      = [None]
+
+    def _worker():
+        try:
+            result[0] = fn(*args, **kwargs)
+        except Exception as e:
+            exc[0] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive():
+        return _TIMED_OUT   # thread sigue en bg pero no bloquea
+    if exc[0] is not None:
+        raise exc[0]
+    return result[0]
+
+
 def fetch_stocks_all(
     stocks:   list  = None,
     interval: str   = "1h",
@@ -176,8 +229,31 @@ def fetch_stocks_all(
         name   = stock["name"]
         print(f"  [{i+1}/{total}] {name} ({symbol})...", end=" ", flush=True)
 
-        ohlcv = get_stock_ohlcv(symbol, interval, months, start_dt, end_dt)
-        stats = get_stock_stats(symbol)
+        try:
+            _r = _run_with_timeout(
+                get_stock_ohlcv,
+                args=(symbol, interval, months, start_dt, end_dt),
+                timeout_sec=45,
+            )
+            if _r is _TIMED_OUT:
+                print(f"\n  ⚠️  Timeout (45s) — {symbol} no respondió a tiempo", flush=True)
+                ohlcv = None
+            else:
+                ohlcv = _r
+        except Exception as e:
+            print(f"\n  ⚠️  Error descargando {symbol}: {e}")
+            ohlcv = None
+
+        try:
+            _r = _run_with_timeout(
+                get_stock_stats,
+                args=(symbol,),
+                timeout_sec=20,
+            )
+            stats = None if _r is _TIMED_OUT else _r
+        except Exception as e:
+            print(f"\n  ⚠️  Error stats {symbol}: {e}")
+            stats = None
 
         if ohlcv is not None and not ohlcv.empty and stats is not None:
             # Usar misma estructura que crypto para compatibilidad

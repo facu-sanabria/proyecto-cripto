@@ -4,3 +4,5 @@ numpy
 openpyxl
 schedule
 python-dotenv
+yfinance
+rich
