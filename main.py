@@ -64,6 +64,7 @@ TF_FAST            = "5m"
 TF_SLOW            = "15m"
 CANDLES_FAST       = 100
 CANDLES_SLOW       = 60
+TRADE_LOG_COOLDOWN = 90 * 60  # no re-loguear misma crypto en 90 min
 
 # Acciones — análisis en 1h (swing/posición, NO scalping)
 # Yahoo Finance gratis tiene 15 min de delay: no apto para scalping en 5m
@@ -80,13 +81,15 @@ STOCKS = [
 # ─── Estado compartido ────────────────────────────────────────────────────────
 _lock  = threading.Lock()
 _state = {
-    "prices":      {},
-    "prev_prices": {},
-    "signals":     {},
-    "change_24h":  {},
-    "ts_prices":   None,
-    "ts_signals":  None,
-    "loading":     True,
+    "prices":          {},
+    "prev_prices":     {},
+    "signals":         {},
+    "change_24h":      {},
+    "ts_prices":       None,
+    "ts_signals":      None,
+    "loading":         True,
+    "trade_log":       [],   # historial de señales COMPRAR para estadísticas
+    "trade_logged_at": {},   # sym → float (time.time()) del último log
 }
 
 # Estado de acciones (análisis 1h, separado del scalping crypto)
@@ -165,6 +168,22 @@ def indicator_updater():
             _state["change_24h"].update(changes)
             _state["ts_signals"] = datetime.now()
             _state["loading"]    = False
+
+            # ── Trade log: registrar señales COMPRAR para estadísticas ──────
+            now_ts = time.time()
+            for sym, sig in new_sigs.items():
+                if sig.get("signal") == "COMPRAR":
+                    last_logged = _state["trade_logged_at"].get(sym, 0)
+                    if (now_ts - last_logged) >= TRADE_LOG_COOLDOWN:
+                        _state["trade_log"].append({
+                            "sym":     sym,
+                            "name":    sig["name"],
+                            "entry":   sig["price"],
+                            "sl_pct":  sig["sl_pct"],
+                            "tp1_pct": sig["tp1_pct"],
+                            "ts":      datetime.now(),
+                        })
+                        _state["trade_logged_at"][sym] = now_ts
 
         time.sleep(INDICATOR_INTERVAL)
 
@@ -611,12 +630,106 @@ def build_tips() -> Panel:
     return Panel(tips, box=box.HORIZONTALS, style="on grey7", padding=(0, 1))
 
 
+def build_stats_panel() -> Panel:
+    """Panel de estadísticas de sesión: operaciones COMPRAR y rendimiento acumulado."""
+    with _lock:
+        log     = list(_state["trade_log"])
+        prices  = dict(_state["prices"])
+        loading = _state["loading"]
+
+    title = "[bold white] 📊 ESTADÍSTICAS DE SESIÓN [/]"
+
+    if loading or not log:
+        msg = (
+            "[dim]Esperando señales COMPRAR...  "
+            "Las operaciones registradas aparecerán aquí con su resultado.[/]"
+        )
+        return Panel(
+            Align.center(msg, vertical="middle"),
+            title=title,
+            border_style="steel_blue1",
+            height=3,
+        )
+
+    wins = losses = open_ = 0
+    accum_pct = 0.0
+    rows = []
+
+    for trade in log:
+        sym     = trade["sym"]
+        name    = trade["name"]
+        entry   = trade["entry"]
+        sl_pct  = trade["sl_pct"]
+        tp1_pct = trade["tp1_pct"]
+        ts      = trade["ts"]
+        current = prices.get(sym, entry)
+
+        tp1_price = entry * (1 + tp1_pct / 100)
+        sl_price  = entry * (1 - sl_pct  / 100)
+        pct_now   = (current - entry) / entry * 100
+
+        if current >= tp1_price:
+            result_t   = Text(f"✓ WIN  (+{tp1_pct:.1f}%)", style="bold green")
+            accum_pct += tp1_pct
+            wins      += 1
+        elif current <= sl_price:
+            result_t   = Text(f"✗ LOSS (-{sl_pct:.1f}%)", style="bold red")
+            accum_pct -= sl_pct
+            losses    += 1
+        else:
+            col      = "green" if pct_now >= 0 else "red"
+            result_t = Text(f"● OPEN ({pct_now:+.2f}%)", style=col)
+            open_   += 1
+
+        rows.append((name, ts.strftime("%H:%M"), fmt_price(entry), fmt_price(current), result_t))
+
+    closed   = wins + losses
+    win_rate = (wins / closed * 100) if closed > 0 else 0.0
+    acc_col  = "green" if accum_pct >= 0 else "red"
+
+    # Línea de resumen
+    summary = (
+        f"  [bold white]Operaciones:[/] {len(log)}   "
+        f"[bold green]✓ Ganadas: {wins}[/]   "
+        f"[bold red]✗ Perdidas: {losses}[/]   "
+        f"[yellow]● Abiertas: {open_}[/]   "
+        f"[dim]│[/]   "
+        f"[white]Win Rate: [bold]{win_rate:.0f}%[/][/]   "
+        f"[white]Ganancia acumulada: [{acc_col} bold]{accum_pct:+.2f}%[/][/]"
+    )
+
+    # Tabla de operaciones individuales
+    tbl = Table(
+        box=box.SIMPLE,
+        show_header=True,
+        header_style="dim white",
+        expand=True,
+        padding=(0, 1),
+    )
+    tbl.add_column("PAR",      width=6,  justify="left",  style="cyan")
+    tbl.add_column("HORA",     width=6,  justify="center", style="dim")
+    tbl.add_column("ENTRADA",  width=13, justify="right")
+    tbl.add_column("ACTUAL",   width=13, justify="right")
+    tbl.add_column("RESULTADO",width=20, justify="left")
+
+    for name, ts_str, entry_str, curr_str, result_t in rows:
+        tbl.add_row(name, ts_str, entry_str, curr_str, result_t)
+
+    return Panel(
+        Group(Text.from_markup(summary), tbl),
+        title=title,
+        border_style="steel_blue1",
+        padding=(0, 0),
+    )
+
+
 def build_display() -> Group:
     return Group(
         build_header(),
         build_price_table(),
         build_stocks_table(),
         build_signal_panel(),
+        build_stats_panel(),
         build_tips(),
     )
 
