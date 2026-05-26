@@ -17,6 +17,8 @@ import pandas as pd
 import numpy as np
 import time
 import threading
+import requests
+import concurrent.futures
 
 # ─── Lista de acciones y ETFs a analizar ─────────────────────────────────────
 
@@ -291,3 +293,100 @@ def get_stock_info(symbol: str) -> dict:
         }
     except Exception:
         return {}
+
+
+# ─── API v8 directa (más rápida y confiable que yfinance) ─────────────────────
+
+_YF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept":     "application/json",
+}
+
+
+def get_stock_ohlcv_v8(
+    symbol:    str,
+    interval:  str = "1h",
+    range_str: str = "60d",
+) -> tuple:
+    """
+    Descarga OHLCV + precio actual via Yahoo Finance v8 API (requests directo).
+    Evita yfinance y su overhead/inestabilidad. Sin API key.
+
+    Args:
+        symbol:    ticker Yahoo (ej: "AAPL", "SPY")
+        interval:  "1m", "5m", "15m", "1h", "1d"
+        range_str: "1d", "5d", "60d", "1y"  — rango de velas a descargar
+
+    Returns:
+        (df, current_price, change_pct_24h)
+        df tiene columnas open/high/low/close/volume con DatetimeIndex.
+        Cualquiera puede ser None si hubo error.
+    """
+    url    = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {
+        "interval":       interval,
+        "range":          range_str,
+        "includePrePost": "false",
+        "events":         "div,split",
+    }
+    try:
+        r = requests.get(url, headers=_YF_HEADERS, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        result = data["chart"]["result"][0]
+        meta   = result["meta"]
+
+        current_price = float(meta.get("regularMarketPrice") or 0)
+        prev_close    = float(meta.get("previousClose") or meta.get("chartPreviousClose") or 0)
+        change_pct    = ((current_price - prev_close) / prev_close * 100) if prev_close else 0.0
+
+        timestamps = result.get("timestamp") or []
+        quotes     = result["indicators"]["quote"][0]
+
+        if not timestamps or not current_price:
+            return None, (current_price or None), change_pct
+
+        df = pd.DataFrame({
+            "open":   [float(v) if v is not None else None for v in quotes.get("open",   [])],
+            "high":   [float(v) if v is not None else None for v in quotes.get("high",   [])],
+            "low":    [float(v) if v is not None else None for v in quotes.get("low",    [])],
+            "close":  [float(v) if v is not None else None for v in quotes.get("close",  [])],
+            "volume": [float(v) if v is not None else 0.0  for v in quotes.get("volume", [])],
+        }, index=pd.to_datetime(timestamps, unit="s"))
+
+        df.index.name = "timestamp"
+        df = df.dropna(subset=["open", "high", "low", "close"])
+
+        return (df if not df.empty else None), current_price, change_pct
+
+    except Exception:
+        return None, None, None
+
+
+def get_stocks_prices_bulk(symbols: list) -> dict:
+    """
+    Fetch precios actuales para múltiples acciones en paralelo.
+    1 request por símbolo, concurrente — similar a ticker/price de Binance.
+
+    Returns:
+        {symbol: (price, change_pct_24h)}  — solo símbolos con datos válidos
+    """
+    def _fetch_one(sym: str):
+        url    = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+        params = {"interval": "1m", "range": "1d", "includePrePost": "false"}
+        try:
+            r    = requests.get(url, headers=_YF_HEADERS, params=params, timeout=8)
+            r.raise_for_status()
+            meta = r.json()["chart"]["result"][0]["meta"]
+            price    = float(meta.get("regularMarketPrice") or 0)
+            prev_c   = float(meta.get("previousClose") or meta.get("chartPreviousClose") or 0)
+            chg_pct  = ((price - prev_c) / prev_c * 100) if prev_c else 0.0
+            return sym, (price, chg_pct) if price > 0 else None
+        except Exception:
+            return sym, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        pairs = list(ex.map(_fetch_one, symbols))
+
+    return {sym: val for sym, val in pairs if val is not None}

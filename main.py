@@ -33,7 +33,7 @@ from rich         import box
 from fetcher        import get_ohlcv
 from scalper        import analyze_scalp, fmt_price
 from notifier       import send_telegram, should_notify
-from stocks_fetcher import fetch_stocks_all
+from stocks_fetcher import fetch_stocks_all, get_stock_ohlcv_v8, get_stocks_prices_bulk
 from analyzer       import analyze_crypto
 
 # ─── Activos a analizar ───────────────────────────────────────────────────────
@@ -56,15 +56,16 @@ ASSETS = [
     {"symbol": "MATICUSDT","name": "MATIC"},
 ]
 
-BINANCE_BASE       = "https://api.binance.com/api/v3"
-PRICE_INTERVAL_SEC = 3    # actualizar precios crypto cada N segundos
-INDICATOR_INTERVAL = 60   # recalcular indicadores crypto cada N segundos
-STOCKS_INTERVAL    = 300  # actualizar acciones cada 5 min (Yahoo delay 15min)
-TF_FAST            = "5m"
-TF_SLOW            = "15m"
-CANDLES_FAST       = 100
-CANDLES_SLOW       = 60
-TRADE_LOG_COOLDOWN = 90 * 60  # no re-loguear misma crypto en 90 min
+BINANCE_BASE          = "https://api.binance.com/api/v3"
+PRICE_INTERVAL_SEC    = 3    # actualizar precios crypto cada N segundos
+INDICATOR_INTERVAL    = 60   # recalcular indicadores crypto cada N segundos
+STOCKS_PRICE_INTERVAL = 60   # actualizar precios acciones cada 60s
+STOCKS_SIG_INTERVAL   = 180  # recalcular indicadores acciones cada 3 min
+TF_FAST               = "5m"
+TF_SLOW               = "15m"
+CANDLES_FAST          = 100
+CANDLES_SLOW          = 60
+TRADE_LOG_COOLDOWN    = 90 * 60  # no re-loguear misma crypto en 90 min
 
 # Acciones — análisis en 1h (swing/posición, NO scalping)
 # Yahoo Finance gratis tiene 15 min de delay: no apto para scalping en 5m
@@ -92,9 +93,11 @@ _state = {
     "trade_logged_at": {},   # sym → float (time.time()) del último log
 }
 
-# Estado de acciones (análisis 1h, separado del scalping crypto)
-_stocks_state   = {}   # symbol → dict con score, signal, rsi, etc.
-_ts_stocks      = None
+# Estado de acciones — dos capas: precios rápidos + análisis lento
+_stocks_prices  = {}   # symbol → (price, change_pct) — actualiza cada 60s
+_stocks_state   = {}   # symbol → dict completo con score, rsi, etc. — cada 3 min
+_ts_stocks_p    = None # timestamp último update de precios acciones
+_ts_stocks      = None # timestamp último update de indicadores acciones
 _stocks_loading = True
 
 
@@ -188,63 +191,74 @@ def indicator_updater():
         time.sleep(INDICATOR_INTERVAL)
 
 
-def stocks_updater():
-    """Thread 3: análisis 1h de acciones via Yahoo Finance cada 5 minutos.
-    ⚠️  Yahoo gratis tiene 15 min delay — útil para tendencia, NO para scalping."""
-    global _stocks_state, _ts_stocks, _stocks_loading
-    import os
-
+def stocks_price_updater():
+    """Thread 3a: precios rápidos de acciones cada 60s via Yahoo v8 API directo."""
+    global _stocks_prices, _ts_stocks_p
+    symbols = [s["symbol"] for s in STOCKS]
     while True:
-        try:
-            # Silenciar prints de yfinance
-            _devnull = open(os.devnull, "w", encoding="utf-8")
-            _orig    = sys.stdout
-            sys.stdout = _devnull
+        result = get_stocks_prices_bulk(symbols)
+        if result:
+            with _lock:
+                _stocks_prices.update(result)
+                _ts_stocks_p = datetime.now()
+        time.sleep(STOCKS_PRICE_INTERVAL)
 
-            raw = fetch_stocks_all(STOCKS, interval="1h", months=2)
 
-            sys.stdout = _orig
-            _devnull.close()
-
-            new_stocks = {}
-            for data in raw:
-                sym = data["crypto"]["symbol"]
-                try:
+def stocks_indicator_updater():
+    """Thread 3b: indicadores 1h de acciones cada 3 min via Yahoo v8 API."""
+    global _stocks_state, _ts_stocks, _stocks_loading
+    while True:
+        new_stocks = {}
+        for s in STOCKS:
+            sym = s["symbol"]
+            try:
+                df, price, change_pct = get_stock_ohlcv_v8(sym, interval="1h", range_str="60d")
+                if df is not None and len(df) >= 30 and price:
+                    data = {
+                        "crypto": {
+                            "symbol":     sym,
+                            "name":       s["name"],
+                            "asset_type": s.get("type", "stock"),
+                        },
+                        "ohlcv": df,
+                        "stats": {
+                            "price":       price,
+                            "change_pct":  change_pct,
+                            "volume_usdt": 0,
+                        },
+                    }
                     result = analyze_crypto(data)
                     new_stocks[sym] = {
-                        "name":        data["crypto"]["name"],
-                        "price":       result["price"],
-                        "change_24h":  result.get("change_24h"),
-                        "rsi":         result.get("rsi"),
-                        "macd_hist":   result.get("macd_hist"),
-                        "ema_trend":   result.get("ema_trend"),
-                        "atr_pct":     result.get("atr_pct"),
-                        "score":       result["score"],
-                        "signal":      result["signal"],
-                        "reason":      result.get("reason", ""),
-                        "stop_loss":   result.get("stop_loss"),
-                        "take_profit": result.get("take_profit"),
-                        "risk_reward": result.get("risk_reward"),
-                        "status":      "ok",
+                        "name":       s["name"],
+                        "price":      price,
+                        "change_24h": change_pct,
+                        "rsi":        result.get("rsi"),
+                        "macd_hist":  result.get("macd_hist"),
+                        "ema_trend":  result.get("ema_trend"),
+                        "atr_pct":    result.get("atr_pct"),
+                        "score":      result["score"],
+                        "signal":     result["signal"],
+                        "reason":     result.get("reason", ""),
+                        "status":     "ok",
                     }
-                except Exception:
-                    pass
+                elif price:
+                    # Tenemos precio pero no suficientes velas para indicadores
+                    new_stocks[sym] = {
+                        "name":   s["name"],
+                        "price":  price,
+                        "change_24h": change_pct,
+                        "status": "no_data",
+                    }
+            except Exception:
+                pass
+            time.sleep(0.5)
 
-            # Marcar los que fallaron
-            for s in STOCKS:
-                if s["symbol"] not in new_stocks and s["symbol"] not in _stocks_state:
-                    new_stocks[s["symbol"]] = {"name": s["name"], "status": "no_data"}
+        with _lock:
+            _stocks_state.update(new_stocks)
+            _ts_stocks      = datetime.now()
+            _stocks_loading = False
 
-            with _lock:
-                _stocks_state.update(new_stocks)
-                _ts_stocks      = datetime.now()
-                _stocks_loading = False
-
-        except Exception:
-            with _lock:
-                _stocks_loading = False
-
-        time.sleep(STOCKS_INTERVAL)
+        time.sleep(STOCKS_SIG_INTERVAL)
 
 
 def _send_scalp_alert(symbol: str, sig: dict):
@@ -497,33 +511,46 @@ def build_signal_panel() -> Panel:
 
 
 def build_stocks_table() -> Panel:
-    """Tabla de acciones con análisis 1h. Se actualiza cada 5 min."""
+    """Tabla de acciones USA — precios cada 60s, indicadores 1h cada 3 min."""
     with _lock:
         snap    = dict(_stocks_state)
+        fast_p  = dict(_stocks_prices)
         loading = _stocks_loading
-        ts      = _ts_stocks
+        ts_sig  = _ts_stocks
+        ts_p    = _ts_stocks_p
 
-    ts_str = ts.strftime("%H:%M:%S") if ts else "─"
-
-    # Verificar si es horario de mercado (ET = UTC-4 en verano, UTC-5 en invierno)
+    # Horario de mercado NYSE (ET = UTC-4 verano, UTC-5 invierno)
     from datetime import timezone, timedelta
-    et_now    = datetime.now(timezone(timedelta(hours=-4)))
-    market_open = (et_now.weekday() < 5 and
-                   et_now.hour >= 9 and
-                   (et_now.hour > 9 or et_now.minute >= 30) and
-                   et_now.hour < 16)
-    market_txt = "[green]● Mercado abierto[/]" if market_open else "[red]● Mercado cerrado[/]"
+    et_now      = datetime.now(timezone(timedelta(hours=-4)))
+    market_open = (
+        et_now.weekday() < 5 and
+        et_now.hour >= 9 and
+        (et_now.hour > 9 or et_now.minute >= 30) and
+        et_now.hour < 16
+    )
+    mkt_txt  = "[green]● ABIERTO[/]" if market_open else "[red]● CERRADO[/]"
+    ts_str   = ts_sig.strftime("%H:%M:%S") if ts_sig else "─"
+    tp_str   = ts_p.strftime("%H:%M:%S")   if ts_p   else "─"
 
     title = (
-        f"[bold white] 📈 ACCIONES USA — Análisis 1h [/]  "
-        f"[dim]│  {market_txt}  │  15 min delay  │  act: {ts_str}[/]"
+        f"[bold white] 📈 ACCIONES USA [/]  "
+        f"[dim]│  {mkt_txt}  │  "
+        f"precios: {tp_str}  │  indicadores: {ts_str}[/]"
     )
 
     if loading:
         return Panel(
-            Align.center("[dim yellow]Descargando datos de Yahoo Finance...[/]", vertical="middle"),
-            title=title, height=5,
+            Align.center("[dim yellow]⏳ Descargando datos de acciones...[/]", vertical="middle"),
+            title=title, border_style="magenta", height=4,
         )
+
+    STOCK_SIG = {
+        "STRONG BUY":  ("bold white on green",  "⬆  STRONG BUY"),
+        "BUY":         ("bold green",            "▲  BUY"),
+        "NEUTRAL":     ("yellow",                "─  NEUTRAL"),
+        "SELL":        ("bold dark_orange",      "▼  SELL"),
+        "STRONG SELL": ("bold white on red",     "⬇  STRONG SELL"),
+    }
 
     table = Table(
         box=box.SIMPLE_HEAVY,
@@ -532,54 +559,55 @@ def build_stocks_table() -> Panel:
         show_edge=True,
         expand=True,
         padding=(0, 1),
-        show_header=True,
     )
-    table.add_column("TICKER",    width=8,  justify="left",  style="bold magenta")
+    table.add_column("TICKER",    width=7,  justify="left",  style="bold magenta")
     table.add_column("NOMBRE",    width=11, justify="left")
-    table.add_column("PRECIO",    width=10, justify="right")
+    table.add_column("PRECIO",    width=11, justify="right")
+    table.add_column("DIR",       width=3,  justify="center")
     table.add_column("24H %",     width=8,  justify="right")
     table.add_column("RSI (1h)",  width=9,  justify="center")
     table.add_column("MACD",      width=6,  justify="center")
     table.add_column("TENDENCIA", width=12, justify="center")
     table.add_column("SCORE",     width=7,  justify="center")
-    table.add_column("SEÑAL",     width=18, justify="center")
+    table.add_column("SEÑAL",     width=16, justify="center")
 
-    # Ordenar por score
     stock_list = sorted(
-        [s for s in STOCKS],
+        STOCKS,
         key=lambda s: snap.get(s["symbol"], {}).get("score", -999) or -999,
         reverse=True,
     )
 
-    STOCK_SIGNAL_STYLE = {
-        "STRONG BUY":  ("bold white on green",  "⬆  STRONG BUY"),
-        "BUY":         ("bold green",            "▲  BUY"),
-        "NEUTRAL":     ("yellow",                "─  NEUTRAL"),
-        "SELL":        ("bold dark_orange",       "▼  SELL"),
-        "STRONG SELL": ("bold white on red",      "⬇  STRONG SELL"),
-    }
-
     for s in stock_list:
-        sym  = s["symbol"]
-        data = snap.get(sym, {})
+        sym    = s["symbol"]
+        data   = snap.get(sym, {})
+        fp     = fast_p.get(sym)            # (price, change_pct) or None
 
+        # Precio: fast_prices tiene prioridad, fallback a snap
+        if fp:
+            price, ch = fp
+        else:
+            price = (data.get("price") or 0)
+            ch    = data.get("change_24h") or 0
+
+        # Flecha de dirección (comparar con precio de snapshot)
+        snap_price = data.get("price") or price
+        if   price > snap_price * 1.0001: arrow = Text("▲", style="bold green")
+        elif price < snap_price * 0.9999: arrow = Text("▼", style="bold red")
+        else:                             arrow = Text("·", style="dim")
+
+        p_txt  = Text(f"${price:,.2f}" if price > 0 else "─", style="white")
+        ch_txt = Text(f"{ch:+.2f}%", style="green" if ch >= 0 else "red") if ch else Text("─", style="dim")
+
+        # Sin datos de indicadores todavía
         if not data or data.get("status") == "no_data":
-            status_txt = "[green]Abierto[/]" if market_open else "[dim]Cerrado[/]"
+            label = "Calculando..." if loading or not ts_sig else ("Sin datos" if market_open else "─")
             table.add_row(
-                sym, s["name"],
+                sym, s["name"], p_txt, arrow, ch_txt,
                 Text("─", style="dim"), Text("─", style="dim"),
                 Text("─", style="dim"), Text("─", style="dim"),
-                Text("─", style="dim"), Text("─", style="dim"),
-                Text(f"{'Sin datos' if market_open else 'Mercado cerrado'}", style="dim"),
+                Text(label, style="dim"),
             )
             continue
-
-        price = data.get("price", 0) or 0
-        p_txt = Text(f"${price:,.2f}" if price > 0 else "─", style="white")
-
-        ch = data.get("change_24h")
-        ch_txt = Text(f"{ch:+.2f}%", style="green" if (ch or 0) >= 0 else "red") \
-            if ch is not None else Text("─", style="dim")
 
         rsi = data.get("rsi")
         if rsi is None:   rsi_t = Text("─", style="dim")
@@ -590,29 +618,30 @@ def build_stocks_table() -> Panel:
         else:             rsi_t = Text(f"{rsi:.0f}", style="white")
 
         mh = data.get("macd_hist")
-        if mh is None:    macd_t = Text("─", style="dim")
-        elif mh > 0:      macd_t = Text("▲ +", style="bold green")
-        elif mh < 0:      macd_t = Text("▼ −", style="bold red")
-        else:             macd_t = Text("─", style="dim")
+        if mh is None:   macd_t = Text("─", style="dim")
+        elif mh > 0:     macd_t = Text("▲ +", style="bold green")
+        elif mh < 0:     macd_t = Text("▼ −", style="bold red")
+        else:            macd_t = Text("─", style="dim")
 
         trend = data.get("ema_trend")
         if trend is None:
             trend_t = Text("─", style="dim")
         else:
-            t_st = "green" if "Alcista" in trend else ("red" if "Bajista" in trend else "dim")
+            t_st    = "green" if "Alcista" in trend else ("red" if "Bajista" in trend else "dim")
             trend_t = Text(trend[:11], style=t_st)
 
-        score = data.get("score")
-        sc_t  = _fmt_score(score) if score is not None else Text("─", style="dim")
+        score  = data.get("score")
+        sc_t   = _fmt_score(score) if score is not None else Text("─", style="dim")
 
         signal = data.get("signal")
         if signal:
-            sty, lbl = STOCK_SIGNAL_STYLE.get(signal, ("white", signal))
+            sty, lbl = STOCK_SIG.get(signal, ("white", signal))
             sig_t = Text(f" {lbl} ", style=sty)
         else:
             sig_t = Text("─", style="dim")
 
-        table.add_row(sym, s["name"], p_txt, ch_txt, rsi_t, macd_t, trend_t, sc_t, sig_t)
+        table.add_row(sym, s["name"], p_txt, arrow, ch_txt,
+                      rsi_t, macd_t, trend_t, sc_t, sig_t)
 
     return Panel(table, title=title, border_style="magenta", padding=(0, 0))
 
@@ -633,16 +662,15 @@ def build_tips() -> Panel:
 def build_stats_panel() -> Panel:
     """Panel de estadísticas de sesión: operaciones COMPRAR y rendimiento acumulado."""
     with _lock:
-        log     = list(_state["trade_log"])
-        prices  = dict(_state["prices"])
-        loading = _state["loading"]
+        log    = list(_state["trade_log"])
+        prices = dict(_state["prices"])
 
     title = "[bold white] 📊 ESTADÍSTICAS DE SESIÓN [/]"
 
-    if loading or not log:
+    if not log:
         msg = (
-            "[dim]Esperando señales COMPRAR...  "
-            "Las operaciones registradas aparecerán aquí con su resultado.[/]"
+            "[dim]Sin operaciones registradas aún.  "
+            "Cada señal COMPRAR queda registrada aquí automáticamente.[/]"
         )
         return Panel(
             Align.center(msg, vertical="middle"),
@@ -727,9 +755,9 @@ def build_display() -> Group:
     return Group(
         build_header(),
         build_price_table(),
+        build_stats_panel(),    # siempre visible — justo bajo tabla crypto
         build_stocks_table(),
         build_signal_panel(),
-        build_stats_panel(),
         build_tips(),
     )
 
@@ -742,12 +770,14 @@ def main():
     console.print(f"[dim]   {len(ASSETS)} activos  │  TF: {TF_FAST}/{TF_SLOW}  │  Refresh: {PRICE_INTERVAL_SEC}s[/]")
     console.print(f"[dim]   Indicadores: cada {INDICATOR_INTERVAL}s  │  Telegram: ON para señales COMPRAR[/]\n")
 
-    t1 = threading.Thread(target=price_updater,     daemon=True, name="PriceThread")
-    t2 = threading.Thread(target=indicator_updater, daemon=True, name="IndicatorThread")
-    t3 = threading.Thread(target=stocks_updater,    daemon=True, name="StocksThread")
+    t1 = threading.Thread(target=price_updater,          daemon=True, name="CryptoPriceThread")
+    t2 = threading.Thread(target=indicator_updater,      daemon=True, name="CryptoIndThread")
+    t3 = threading.Thread(target=stocks_price_updater,   daemon=True, name="StocksPriceThread")
+    t4 = threading.Thread(target=stocks_indicator_updater, daemon=True, name="StocksIndThread")
     t1.start()
     t2.start()
     t3.start()
+    t4.start()
 
     # Esperar primer lote de precios
     time.sleep(4)
