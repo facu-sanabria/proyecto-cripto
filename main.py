@@ -59,8 +59,9 @@ ASSETS = [
 BINANCE_BASE          = "https://api.binance.com/api/v3"
 PRICE_INTERVAL_SEC    = 3    # actualizar precios crypto cada N segundos
 INDICATOR_INTERVAL    = 60   # recalcular indicadores crypto cada N segundos
-STOCKS_PRICE_INTERVAL = 60   # actualizar precios acciones cada 60s
+STOCKS_PRICE_INTERVAL = 15   # actualizar precios acciones cada 15s (7 req paralelas)
 STOCKS_SIG_INTERVAL   = 180  # recalcular indicadores acciones cada 3 min
+STOCK_NOTIFY_SIGNAL   = "STRONG BUY"  # señal que dispara Telegram + estadísticas
 TF_FAST               = "5m"
 TF_SLOW               = "15m"
 CANDLES_FAST          = 100
@@ -205,16 +206,19 @@ def stocks_price_updater():
 
 
 def stocks_indicator_updater():
-    """Thread 3b: indicadores 1h de acciones cada 3 min via Yahoo v8 API."""
+    """Thread 3b: indicadores 1h de acciones cada 3 min via Yahoo v8 API.
+    Dispara Telegram + loguea en trade_log cuando señal = STRONG BUY."""
     global _stocks_state, _ts_stocks, _stocks_loading
     while True:
-        new_stocks = {}
+        new_stocks     = {}
+        alerts_pending = []   # (sym, data_dict) a notificar tras liberar el lock
+
         for s in STOCKS:
             sym = s["symbol"]
             try:
                 df, price, change_pct = get_stock_ohlcv_v8(sym, interval="1h", range_str="60d")
                 if df is not None and len(df) >= 30 and price:
-                    data = {
+                    input_data = {
                         "crypto": {
                             "symbol":     sym,
                             "name":       s["name"],
@@ -227,36 +231,73 @@ def stocks_indicator_updater():
                             "volume_usdt": 0,
                         },
                     }
-                    result = analyze_crypto(data)
+                    result = analyze_crypto(input_data)
+
+                    stop_loss   = result.get("stop_loss")
+                    take_profit = result.get("take_profit")
+                    sl_pct  = ((price - stop_loss)   / price * 100) if stop_loss   else 2.0
+                    tp1_pct = ((take_profit - price) / price * 100) if take_profit else 4.0
+
+                    entry = {
+                        "name":         s["name"],
+                        "price":        price,
+                        "change_24h":   change_pct,
+                        "rsi":          result.get("rsi"),
+                        "macd_hist":    result.get("macd_hist"),
+                        "ema_trend":    result.get("ema_trend"),
+                        "atr_pct":      result.get("atr_pct"),
+                        "score":        result["score"],
+                        "signal":       result["signal"],
+                        "reason":       result.get("reason", ""),
+                        "stop_loss":    stop_loss,
+                        "take_profit":  take_profit,
+                        "risk_reward":  result.get("risk_reward"),
+                        "sl_pct":       sl_pct,
+                        "tp1_pct":      tp1_pct,
+                        "status":       "ok",
+                    }
+                    new_stocks[sym] = entry
+
+                    # Telegram + trade_log cuando STRONG BUY
+                    if result["signal"] == STOCK_NOTIFY_SIGNAL and should_notify(sym):
+                        alerts_pending.append((sym, entry))
+
+                elif price:
                     new_stocks[sym] = {
                         "name":       s["name"],
                         "price":      price,
                         "change_24h": change_pct,
-                        "rsi":        result.get("rsi"),
-                        "macd_hist":  result.get("macd_hist"),
-                        "ema_trend":  result.get("ema_trend"),
-                        "atr_pct":    result.get("atr_pct"),
-                        "score":      result["score"],
-                        "signal":     result["signal"],
-                        "reason":     result.get("reason", ""),
-                        "status":     "ok",
-                    }
-                elif price:
-                    # Tenemos precio pero no suficientes velas para indicadores
-                    new_stocks[sym] = {
-                        "name":   s["name"],
-                        "price":  price,
-                        "change_24h": change_pct,
-                        "status": "no_data",
+                        "status":     "no_data",
                     }
             except Exception:
                 pass
             time.sleep(0.5)
 
+        # ── Actualizar estado + loguear trades (con lock) ──────────────────────
+        now_ts = time.time()
         with _lock:
             _stocks_state.update(new_stocks)
             _ts_stocks      = datetime.now()
             _stocks_loading = False
+
+            for sym, entry in alerts_pending:
+                last_logged = _state["trade_logged_at"].get(sym, 0)
+                if (now_ts - last_logged) >= TRADE_LOG_COOLDOWN:
+                    _state["trade_log"].append({
+                        "sym":     sym,
+                        "name":    entry["name"],
+                        "entry":   entry["price"],
+                        "sl_pct":  entry["sl_pct"],
+                        "tp1_pct": entry["tp1_pct"],
+                        "ts":      datetime.now(),
+                        "type":    "stock",
+                    })
+                    _state["trade_logged_at"][sym] = now_ts
+
+        # ── Mandar Telegram fuera del lock ─────────────────────────────────────
+        for sym, entry in alerts_pending:
+            if should_notify(sym):
+                _send_stock_alert(sym, entry)
 
         time.sleep(STOCKS_SIG_INTERVAL)
 
@@ -289,6 +330,43 @@ def _send_scalp_alert(symbol: str, sig: dict):
         f"*Por qué comprar:*\n{reasons_txt}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⏱ TF: {TF_FAST}/{TF_SLOW}  │  {datetime.now().strftime('%H:%M:%S')}"
+    )
+    send_telegram(msg)
+
+
+def _send_stock_alert(symbol: str, data: dict):
+    """Formatea y manda alerta Telegram para señal STRONG BUY de acción USA."""
+    name       = data["name"]
+    price      = data["price"]
+    score      = data.get("score", 0)
+    signal     = data.get("signal", "STRONG BUY")
+    rsi        = data.get("rsi")
+    ema_trend  = data.get("ema_trend", "─")
+    reason     = data.get("reason", "")
+    sl         = data.get("stop_loss")
+    tp         = data.get("take_profit")
+    rr         = data.get("risk_reward", "─")
+
+    sl_pct  = ((price - sl)  / price * 100) if sl  else 0
+    tp_pct  = ((tp - price)  / price * 100) if tp  else 0
+    p_fmt   = f"${price:,.2f}" if price > 1 else f"${price:.4f}"
+    sl_fmt  = f"${sl:,.2f}"   if sl   else "─"
+    tp_fmt  = f"${tp:,.2f}"   if tp   else "─"
+
+    reasons_txt = "\n".join(f"  • {r.strip()}" for r in reason.split(" | ")[:3] if r.strip())
+
+    msg = (
+        f"📈 *STRONG BUY ACCIÓN — {name}* ({symbol})\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 *Precio entrada:*  {p_fmt}\n"
+        f"🛑 *Stop Loss:*       {sl_fmt}  (-{sl_pct:.1f}%)\n"
+        f"🎯 *Take Profit:*     {tp_fmt}  (+{tp_pct:.1f}%)\n"
+        f"📊 *Score:* {score:+d}/100   *R/R:* {rr}x\n"
+        f"📉 *RSI (1h):* {rsi:.0f}   *Tendencia:* {ema_trend}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"*Por qué comprar:*\n{reasons_txt}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ TF: 1h  │  {datetime.now().strftime('%H:%M:%S')}"
     )
     send_telegram(msg)
 
@@ -653,24 +731,25 @@ def build_tips() -> Panel:
         "[red]StochRSI > 80[/] = sobrecomprado (vender)  │  "
         "[magenta]⚡ Squeeze[/] = movimiento fuerte próximo  │  "
         "[yellow]SCORE ≥ 55[/] = señal fuerte  │  "
-        "Telegram: alerta automática en COMPRAR"
+        "Telegram: 🪙 COMPRAR crypto  +  📈 STRONG BUY acciones"
         "[/]"
     )
     return Panel(tips, box=box.HORIZONTALS, style="on grey7", padding=(0, 1))
 
 
 def build_stats_panel() -> Panel:
-    """Panel de estadísticas de sesión: operaciones COMPRAR y rendimiento acumulado."""
+    """Panel de estadísticas de sesión: crypto COMPRAR + stocks STRONG BUY."""
     with _lock:
-        log    = list(_state["trade_log"])
-        prices = dict(_state["prices"])
+        log        = list(_state["trade_log"])
+        crypto_px  = dict(_state["prices"])
+        stocks_px  = dict(_stocks_prices)   # (price, change_pct) por símbolo
 
     title = "[bold white] 📊 ESTADÍSTICAS DE SESIÓN [/]"
 
     if not log:
         msg = (
             "[dim]Sin operaciones registradas aún.  "
-            "Cada señal COMPRAR queda registrada aquí automáticamente.[/]"
+            "Crypto COMPRAR y Acciones STRONG BUY se registran aquí automáticamente.[/]"
         )
         return Panel(
             Align.center(msg, vertical="middle"),
@@ -684,13 +763,20 @@ def build_stats_panel() -> Panel:
     rows = []
 
     for trade in log:
-        sym     = trade["sym"]
-        name    = trade["name"]
-        entry   = trade["entry"]
-        sl_pct  = trade["sl_pct"]
-        tp1_pct = trade["tp1_pct"]
-        ts      = trade["ts"]
-        current = prices.get(sym, entry)
+        sym      = trade["sym"]
+        name     = trade["name"]
+        entry    = trade["entry"]
+        sl_pct   = trade["sl_pct"]
+        tp1_pct  = trade["tp1_pct"]
+        ts       = trade["ts"]
+        is_stock = trade.get("type") == "stock"
+
+        # Precio actual: distintas fuentes según tipo
+        if is_stock:
+            fp      = stocks_px.get(sym)
+            current = fp[0] if fp else entry
+        else:
+            current = crypto_px.get(sym, entry)
 
         tp1_price = entry * (1 + tp1_pct / 100)
         sl_price  = entry * (1 - sl_pct  / 100)
@@ -709,7 +795,9 @@ def build_stats_panel() -> Panel:
             result_t = Text(f"● OPEN ({pct_now:+.2f}%)", style=col)
             open_   += 1
 
-        rows.append((name, ts.strftime("%H:%M"), fmt_price(entry), fmt_price(current), result_t))
+        # Etiqueta de tipo
+        type_tag = Text("📈", style="magenta") if is_stock else Text("🪙", style="cyan")
+        rows.append((type_tag, name, ts.strftime("%H:%M"), fmt_price(entry), fmt_price(current), result_t))
 
     closed   = wins + losses
     win_rate = (wins / closed * 100) if closed > 0 else 0.0
@@ -734,14 +822,15 @@ def build_stats_panel() -> Panel:
         expand=True,
         padding=(0, 1),
     )
+    tbl.add_column("",         width=2,  justify="center")          # tipo 🪙/📈
     tbl.add_column("PAR",      width=6,  justify="left",  style="cyan")
     tbl.add_column("HORA",     width=6,  justify="center", style="dim")
     tbl.add_column("ENTRADA",  width=13, justify="right")
     tbl.add_column("ACTUAL",   width=13, justify="right")
     tbl.add_column("RESULTADO",width=20, justify="left")
 
-    for name, ts_str, entry_str, curr_str, result_t in rows:
-        tbl.add_row(name, ts_str, entry_str, curr_str, result_t)
+    for type_tag, name, ts_str, entry_str, curr_str, result_t in rows:
+        tbl.add_row(type_tag, name, ts_str, entry_str, curr_str, result_t)
 
     return Panel(
         Group(Text.from_markup(summary), tbl),
