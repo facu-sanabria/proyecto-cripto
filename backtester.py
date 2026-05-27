@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 # Forzar UTF-8 en la consola de Windows para que los emojis no rompan
 sys.stdout.reconfigure(encoding="utf-8")
 
-from config import CRYPTOS, TIMEFRAME
+from config import CRYPTOS, TIMEFRAME, SL_ATR_MULT, TP_ATR_MULT
 from analyzer import calc_rsi, calc_macd, calc_ema, calc_bollinger, calc_atr, calc_adx, score_crypto
 from market_context import get_historical_fear_greed, market_context_score_adjustment
 
@@ -49,14 +49,11 @@ INDICATOR_WINDOW   = 200
 # 1h × 96 velas = 4 días  |  4h × 96 velas = 16 días
 MAX_HOLD_CANDLES   = 96
 
-# Stop-loss: 1.5× ATR — da espacio al trade para respirar sin riesgo excesivo
-# Demasiado apretado (1.0×) → salidas prematuras en volatilidad normal de crypto
-SL_MULTIPLIER      = 1.5
-
-# Take-profit: 3.0× ATR — R:R = 1:2
-# Necesitamos >34% WR para ser rentables (conservador y alcanzable)
-# EV = 0.40 × 3.0 - 0.60 × 1.5 = +0.30 (positivo con 40% WR típico)
-TP_MULTIPLIER      = 3.0
+# Stop-loss y Take-profit: importados desde config.py (ÚNICA FUENTE DE VERDAD).
+# Mismo valor que usa analyzer.py en live → paridad live/backtest garantizada.
+# SL_ATR_MULT = 1.5, TP_ATR_MULT = 3.0  →  R/R = 2.0, break-even WR = 33.3%
+SL_MULTIPLIER      = SL_ATR_MULT   # alias local para no romper el resto del archivo
+TP_MULTIPLIER      = TP_ATR_MULT   # alias local para no romper el resto del archivo
 
 
 # ─── Descarga de datos históricos ─────────────────────────────────────────────

@@ -30,3 +30,17 @@ REFRESH_MINUTES = 5
 
 # Nombre del archivo Excel de salida
 EXCEL_PATH = "crypto_signals.xlsx"
+
+# ─── Parámetros ATR para Stop-Loss y Take-Profit ──────────────────────────────
+# ÚNICA FUENTE DE VERDAD — usada por analyzer.py Y backtester.py.
+# Live y backtest deben ser matemáticamente idénticos.
+#
+# SL = precio_entrada - SL_ATR_MULT × ATR
+# TP = precio_entrada + TP_ATR_MULT × ATR
+# R/R = TP_ATR_MULT / SL_ATR_MULT = 3.0 / 1.5 = 2.0
+# Break-even WR mínimo = SL_ATR_MULT / (SL_ATR_MULT + TP_ATR_MULT) = 33.3%
+#
+# NOTA: scalper.py (crypto 5m/15m live) usa SL=1.0×ATR con floor 0.3%.
+# Es un path diferente (timeframe distinto) y NO está cubierto por el backtest de 4h.
+SL_ATR_MULT = 1.5
+TP_ATR_MULT = 3.0

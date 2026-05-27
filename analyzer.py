@@ -8,6 +8,8 @@
 import pandas as pd
 import numpy as np
 
+from config import SL_ATR_MULT, TP_ATR_MULT
+
 
 # ─── Fórmulas de indicadores ──────────────────────────────────────────────────
 
@@ -412,8 +414,8 @@ def analyze_crypto(data: dict) -> dict:
     atr   = indicators["atr"]
     price = stats["price"]
 
-    stop_loss   = round(price - 1.5 * atr, 6)
-    take_profit = round(price + 2.5 * atr, 6)
+    stop_loss   = round(price - SL_ATR_MULT * atr, 6)
+    take_profit = round(price + TP_ATR_MULT * atr, 6)
     risk_reward = round((take_profit - price) / (price - stop_loss), 2) if price > stop_loss else 0
 
     return {
