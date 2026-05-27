@@ -7,7 +7,7 @@
 
 import numpy as np
 import pandas as pd
-from analyzer import calc_rsi, calc_ema, calc_macd, calc_atr, calc_bollinger
+from indicators import calc_rsi, calc_ema, calc_macd, calc_atr, calc_bollinger
 
 
 def calc_stoch_rsi(close: pd.Series, rsi_p=14, stoch_p=14, k_s=3, d_s=3):

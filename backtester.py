@@ -24,7 +24,11 @@ from datetime import datetime, timedelta
 sys.stdout.reconfigure(encoding="utf-8")
 
 from config import CRYPTOS, TIMEFRAME, SL_ATR_MULT, TP_ATR_MULT
-from analyzer import calc_rsi, calc_macd, calc_ema, calc_bollinger, calc_atr, calc_adx, score_crypto
+from indicators import (
+    calc_rsi, calc_macd, calc_ema, calc_bollinger, calc_atr, calc_adx,
+    calculate_indicators_at, INDICATOR_WINDOW as _IND_WINDOW,
+)
+from analyzer import score_crypto
 from market_context import get_historical_fear_greed, market_context_score_adjustment
 
 # ─── Configuración del backtest ───────────────────────────────────────────────
@@ -42,8 +46,8 @@ DEFAULT_CAPITAL    = 1000.0
 # Meses de historial a descargar
 DEFAULT_MONTHS     = 6
 
-# Ventana mínima de velas para calcular EMA200 y demás indicadores
-INDICATOR_WINDOW   = 200
+# Ventana mínima de velas — importada desde indicators.py para mantener consistencia
+INDICATOR_WINDOW   = _IND_WINDOW   # = 200, definido en indicators.py
 
 # Máximo de velas a mantener una posición sin cerrar
 # 1h × 96 velas = 4 días  |  4h × 96 velas = 16 días
@@ -139,62 +143,8 @@ def fetch_historical_ohlcv(
     return df.set_index("timestamp")[["open", "high", "low", "close", "volume"]]
 
 
-# ─── Cálculo de indicadores en ventana histórica ──────────────────────────────
-
-def calculate_indicators_at(df: pd.DataFrame, idx: int) -> dict | None:
-    """
-    Calcula indicadores usando las últimas INDICATOR_WINDOW velas hasta idx.
-    Equivalente a lo que hace el bot en tiempo real, pero para cada punto histórico.
-    """
-    if idx < INDICATOR_WINDOW:
-        return None
-
-    window = df.iloc[max(0, idx - INDICATOR_WINDOW + 1): idx + 1]
-
-    close  = window["close"]
-    high   = window["high"]
-    low    = window["low"]
-    volume = window["volume"]
-
-    rsi_series                  = calc_rsi(close)
-    rsi                         = rsi_series.iloc[-1]
-    rsi_prev                    = rsi_series.iloc[-2] if len(rsi_series) >= 2 else rsi
-
-    macd_line, macd_sig, macd_h = calc_macd(close)
-    macd_hist                   = macd_h.iloc[-1]
-    macd_hist_prev              = macd_h.iloc[-2] if len(macd_h) >= 2 else macd_hist
-
-    ema20                       = calc_ema(close, 20).iloc[-1]
-    ema50                       = calc_ema(close, 50).iloc[-1]
-    ema200                      = calc_ema(close, 200).iloc[-1]
-    _, _, bb_pct_series         = calc_bollinger(close)
-    atr_series                  = calc_atr(high, low, close)
-
-    current_price  = close.iloc[-1]
-    avg_volume     = volume.rolling(20).mean().iloc[-1]
-    current_volume = volume.iloc[-1]
-    volume_ratio   = current_volume / avg_volume if avg_volume > 0 else 1.0
-
-    adx_s, plus_di_s, minus_di_s = calc_adx(high, low, close)
-
-    return {
-        "price":          float(current_price),
-        "rsi":            round(float(rsi), 2),
-        "rsi_prev":       round(float(rsi_prev), 2),
-        "macd_hist":      round(float(macd_hist), 6),
-        "macd_hist_prev": round(float(macd_hist_prev), 6),
-        "ema20":          round(float(ema20), 6),
-        "ema50":          round(float(ema50), 6),
-        "ema200":         round(float(ema200), 6),
-        "bb_pct":         round(float(bb_pct_series.iloc[-1]), 4),
-        "atr":            round(float(atr_series.iloc[-1]), 6),
-        "atr_pct":        round((float(atr_series.iloc[-1]) / float(current_price)) * 100, 2),
-        "volume_ratio":   round(float(volume_ratio), 2),
-        "adx":            round(float(adx_s.iloc[-1]), 2),
-        "plus_di":        round(float(plus_di_s.iloc[-1]), 2),
-        "minus_di":       round(float(minus_di_s.iloc[-1]), 2),
-    }
-
+# calculate_indicators_at importada desde indicators.py (no duplicada aquí).
+# Garantía anti-look-ahead: ventana = df.iloc[max(0, idx-WINDOW+1) : idx+1].
 
 # ─── Daily timeframe helper ───────────────────────────────────────────────────
 
