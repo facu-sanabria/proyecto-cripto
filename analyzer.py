@@ -21,21 +21,27 @@ from indicators import (
 
 # ─── Sistema de scoring ───────────────────────────────────────────────────────
 
-def score_crypto(ind: dict) -> tuple[int, str, str]:
+def score_crypto(ind: dict, adx_min: int = 18) -> tuple[int, str, str]:
     """
     Score de -100 a +100. Cuanto mayor, mejor oportunidad de compra.
 
-    Versión 3: orientado a trend following (como operan los traders profesionales).
+    Versión 4: mejoras basadas en análisis de pérdidas del bot.
 
-    Cambios respecto a v2:
-    - ADX como HARD BLOCK (<18) en lugar de multiplicador ×0.6.
-      El multiplicador aplastaba scores válidos: 85×0.6=51 nunca llegaba a 60.
-    - RSI 60-78 en tendencia fuerte: NO penaliza.
-      En trend following RSI alto = FUERZA, no sobrecompra.
-    - BB superior: eliminada penalización en tendencias.
-      Precio en banda superior durante uptrend = normal y saludable.
-    - Bear market: hard block directo (retorna -35) en lugar de cap=15.
-    - Sin tendencia: retorna 0/NEUTRAL directamente (ADX<18).
+    Cambios respecto a v3:
+    - adx_min parametrizable: 18 para 4h crypto, 13 para 1h stocks
+      (ADX 1h es naturalmente más bajo por mayor ruido intraday).
+    - Volumen DIRECCIONAL: volumen alto + MACD bajista ahora penaliza
+      (confirma presión de venta, no solo ignora).
+    - Detección de distribución/techo: cuando EMA50 converge hacia EMA200
+      y ADX declina, cappear score ≤ 30 (tendencia debilitándose).
+    - Calidad de pullback: bonus +8 si precio ≤ 2% sobre EMA20 en perfect_trend
+      (dip-buy = entrada óptima); penalización -10 si >5% extendido
+      (chasing = peor ratio de éxito).
+
+    Args:
+        ind:     dict de indicadores de compute_indicators().
+        adx_min: ADX mínimo para considerar que hay tendencia.
+                 Usar 18 para 4h, 13 para 1h.
 
     Returns:
         (score, señal, razón)
@@ -52,6 +58,7 @@ def score_crypto(ind: dict) -> tuple[int, str, str]:
     volume_ratio   = ind["volume_ratio"]
     atr_pct        = ind["atr_pct"]
     adx            = ind.get("adx", 25.0)
+    adx_prev       = ind.get("adx_prev", adx)
     plus_di        = ind.get("plus_di", 25.0)
     minus_di       = ind.get("minus_di", 25.0)
 
@@ -64,10 +71,10 @@ def score_crypto(ind: dict) -> tuple[int, str, str]:
     if (price < ema200) and (ema50 < ema200):
         return -35, "STRONG SELL", "Bear market: precio y EMA50 bajo EMA200"
 
-    # 2. Sin tendencia: ADX < 18 = mercado completamente lateral.
+    # 2. Sin tendencia: ADX < adx_min = mercado completamente lateral.
     #    RSI y MACD generan señales falsas en laterales. No operar.
-    if adx < 18:
-        return 0, "NEUTRAL", f"Sin tendencia (ADX {adx:.0f} < 18)"
+    if adx < adx_min:
+        return 0, "NEUTRAL", f"Sin tendencia (ADX {adx:.0f} < {adx_min})"
 
     # 3. Volatilidad extrema: stop-loss demasiado ancho = riesgo incontrolable.
     if atr_pct > 8:
@@ -98,6 +105,19 @@ def score_crypto(ind: dict) -> tuple[int, str, str]:
         # Precio bajo EMA200 pero EMA50 aún sobre EMA200 → transición/distribución
         score -= 15
         reasons.append("Precio bajo EMA200 (debilitando)")
+
+    # ─── Detección de distribución / techo de tendencia ──────────────────────
+    # Señal de alerta: EMA50 converge hacia EMA200 Y ADX declina desde zona alta.
+    # Esto precede frecuentemente a cruces bajistas. Cappear score a 30.
+    if ema200 > 0:
+        ema50_gap_pct = (ema50 - ema200) / ema200 * 100
+    else:
+        ema50_gap_pct = 100.0
+    adx_declining = adx < adx_prev  # ADX bajando = tendencia perdiendo fuerza
+
+    if (perfect_trend or good_trend) and ema50_gap_pct < 2.5 and adx_declining and adx < 28:
+        score = min(score, 30)
+        reasons.append(f"Tendencia debilitándose (gap EMA50/200: {ema50_gap_pct:.1f}%)")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # 2. MOMENTUM MACD (±25)
@@ -130,7 +150,7 @@ def score_crypto(ind: dict) -> tuple[int, str, str]:
     # ═══════════════════════════════════════════════════════════════════════════
     # 3. RSI CON CONTEXTO DE TENDENCIA (±15)
     #
-    #    CLAVE v3: RSI 60-78 en tendencia fuerte NO es sobrecompra, es FUERZA.
+    #    CLAVE v4: RSI 60-78 en tendencia fuerte NO es sobrecompra, es FUERZA.
     #    Un trader no evita entrar porque el RSI está en 68 durante un bull run.
     #    Solo penalizamos RSI extremo (>78) o alto sin confirmación de tendencia.
     # ═══════════════════════════════════════════════════════════════════════════
@@ -171,15 +191,24 @@ def score_crypto(ind: dict) -> tuple[int, str, str]:
     # No penalizar banda superior en tendencias alcistas
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # 5. VOLUMEN — CONFIRMACIÓN (±12)
-    #    Volumen confirma movimientos legítimos. Sin volumen = sin convicción.
+    # 5. VOLUMEN — CONFIRMACIÓN DIRECCIONAL (±12)
+    #    Volumen confirma dirección del movimiento.
+    #    NUEVO v4: volumen alto en caída = presión vendedora = penalizar también.
     # ═══════════════════════════════════════════════════════════════════════════
-    if volume_ratio > 2.0 and macd_hist > 0:
-        score += 12
-        reasons.append(f"Volumen fuerte {volume_ratio:.1f}x confirma")
-    elif volume_ratio > 1.5 and macd_hist > 0:
-        score += 8
-        reasons.append(f"Volumen {volume_ratio:.1f}x confirma")
+    if volume_ratio > 2.0:
+        if macd_hist > 0:
+            score += 12
+            reasons.append(f"Volumen fuerte {volume_ratio:.1f}x confirma alza")
+        else:
+            score -= 10
+            reasons.append(f"Volumen {volume_ratio:.1f}x confirma caída")
+    elif volume_ratio > 1.5:
+        if macd_hist > 0:
+            score += 8
+            reasons.append(f"Volumen {volume_ratio:.1f}x confirma")
+        elif macd_hist < 0:
+            score -= 6
+            reasons.append(f"Volumen {volume_ratio:.1f}x presión bajista")
     elif volume_ratio < 0.7:
         score -= 8
         reasons.append(f"Volumen débil {volume_ratio:.1f}x")
@@ -196,9 +225,28 @@ def score_crypto(ind: dict) -> tuple[int, str, str]:
         reasons.append(f"Volatilidad moderada ({atr_pct:.1f}%)")
 
     # ═══════════════════════════════════════════════════════════════════════════
+    # 7. CALIDAD DEL PULLBACK (±10) — NUEVO v4
+    #    En perfect_trend: el dip-buy cerca de EMA20 es la entrada óptima.
+    #    "Chasing" (precio muy extendido sobre EMA20) = peor probabilidad.
+    # ═══════════════════════════════════════════════════════════════════════════
+    if ema20 > 0:
+        price_vs_ema20_pct = (price - ema20) / ema20 * 100
+    else:
+        price_vs_ema20_pct = 0.0
+
+    if perfect_trend:
+        if -1.5 <= price_vs_ema20_pct <= 2.0:
+            # Precio justo en la EMA20 o levemente sobre ella: zona óptima de entrada
+            score += 8
+            reasons.append(f"Pullback a EMA20 ({price_vs_ema20_pct:+.1f}%) ideal")
+        elif price_vs_ema20_pct > 5.0:
+            # Precio muy extendido: comprar tarde = mayor riesgo de corrección
+            score -= 10
+            reasons.append(f"Precio extendido {price_vs_ema20_pct:.1f}% sobre EMA20")
+
+    # ═══════════════════════════════════════════════════════════════════════════
     # ADX: amplificador de tendencias fuertes (sin multiplicador negativo)
-    # v3: solo amplificamos señales positivas en tendencias muy fuertes.
-    #     Eliminado el ×0.6 que aplastaba scores en ADX 18-25.
+    # v4: solo amplificamos señales positivas en tendencias muy fuertes.
     # ═══════════════════════════════════════════════════════════════════════════
     if adx > 35 and plus_di > minus_di and score > 0:
         score = min(100, int(score * 1.15))
@@ -222,22 +270,25 @@ def score_crypto(ind: dict) -> tuple[int, str, str]:
 
 # ─── Análisis completo ────────────────────────────────────────────────────────
 
-def analyze_crypto(data: dict) -> dict:
+def analyze_crypto(data: dict, adx_threshold: int = 18) -> dict:
     """
-    Análisis completo de una criptomoneda.
+    Análisis completo de una criptomoneda o acción.
 
     Args:
-        data: Dict con keys "crypto", "ohlcv", "stats"
+        data:          Dict con keys "crypto", "ohlcv", "stats"
+        adx_threshold: ADX mínimo para considerar tendencia.
+                       18 para 4h crypto (default), 13 para 1h stocks
+                       (1h produce ADX naturalmente más bajo por ruido intraday).
 
     Returns:
-        Dict listo para el Excel.
+        Dict listo para el Excel / display.
     """
     crypto = data["crypto"]
     ohlcv  = data["ohlcv"]
     stats  = data["stats"]
 
     indicators         = calculate_indicators(ohlcv)
-    score, signal, reason = score_crypto(indicators)
+    score, signal, reason = score_crypto(indicators, adx_min=adx_threshold)
 
     atr   = indicators["atr"]
     price = stats["price"]

@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 # Forzar UTF-8 en la consola de Windows para que los emojis no rompan
 sys.stdout.reconfigure(encoding="utf-8")
 
-from config import CRYPTOS, TIMEFRAME, SL_ATR_MULT, TP_ATR_MULT
+from config import CRYPTOS, TIMEFRAME, SL_ATR_MULT, TP_ATR_MULT, COMMISSION_PCT, SLIPPAGE_PCT
 from indicators import (
     calc_rsi, calc_macd, calc_ema, calc_bollinger, calc_atr, calc_adx,
     calculate_indicators_at, INDICATOR_WINDOW as _IND_WINDOW,
@@ -36,9 +36,12 @@ from market_context import get_historical_fear_greed, market_context_score_adjus
 BINANCE_BASE = "https://api.binance.com/api/v3"
 
 # Score mínimo para entrar en una posición
-# 40 = BUY calificado → balance entre calidad y frecuencia de trades
-# v2 usaba 60 (solo STRONG BUY) → demasiado restrictivo, 0 trades en muchos períodos
-DEFAULT_THRESHOLD  = 40
+# 50 = BUY calificado con filtro de calidad mejorado.
+# Análisis empírico muestra que scores 40-49 tienen win rate < 40% (esperanza negativa
+# con R/R=1.67 cuando break-even WR real = 40.5% incluyendo costos).
+# v1 usaba 40 → incluía demasiadas entradas marginales que destruían performance.
+# v0 usaba 60 (solo STRONG BUY) → demasiado restrictivo, 0 trades en muchos períodos.
+DEFAULT_THRESHOLD  = 50
 
 # Capital inicial en USDT para la simulación
 DEFAULT_CAPITAL    = 1000.0
@@ -307,9 +310,14 @@ def run_backtest(
                 exit_reason = "Timeout"
 
             if exit_price is not None:
-                pnl_pct   = (exit_price - entry_price) / entry_price * 100
-                pnl_usdt  = capital * (pnl_pct / 100)
-                capital  += pnl_usdt
+                # Costos round-trip: comisión + slippage por los 2 lados.
+                # Refleja realidad: apertura taker + cierre taker + slippage.
+                # Sin costos el backtester sobreestima performance ~0.25% por trade.
+                round_trip_cost = (COMMISSION_PCT + SLIPPAGE_PCT) * 2  # en %
+                pnl_pct_gross = (exit_price - entry_price) / entry_price * 100
+                pnl_pct       = pnl_pct_gross - round_trip_cost
+                pnl_usdt      = capital * (pnl_pct / 100)
+                capital      += pnl_usdt
 
                 trades.append({
                     "symbol":         "",
@@ -323,6 +331,7 @@ def run_backtest(
                     "razon_entrada":  f"{entry_signal} (score {entry_score})",
                     "razon_salida":   exit_reason,
                     "pnl_pct":        round(pnl_pct, 2),
+                    "pnl_pct_gross":  round(pnl_pct_gross, 2),
                     "pnl_usdt":       round(pnl_usdt, 4),
                     "capital":        round(capital, 4),
                     "velas_abierto":  hold_candles,
@@ -338,11 +347,20 @@ def run_backtest(
                 equity_curve.append({"fecha": date, "capital": round(capital, 4)})
                 continue
 
-            atr         = ind["atr"]
-            entry_price = close
-            stop_loss   = close - SL_MULTIPLIER * atr
-            take_profit = close + TP_MULTIPLIER * atr
-            highest_since_entry = close
+            atr = ind["atr"]
+
+            # Entrada al OPEN de la siguiente vela (simulación realista de fill).
+            # En live, la señal se detecta al cierre de la vela i. El fill real
+            # ocurre en el open de la vela i+1. Usar close sobrestima performance
+            # porque asume fill instantáneo al mejor precio de cierre.
+            if i + 1 < total_rows:
+                entry_price = float(df.iloc[i + 1]["open"])
+            else:
+                entry_price = close  # última vela del período
+
+            stop_loss   = entry_price - SL_MULTIPLIER * atr
+            take_profit = entry_price + TP_MULTIPLIER * atr
+            highest_since_entry = entry_price
             breakeven_activated = False
 
             in_position  = True
@@ -356,11 +374,13 @@ def run_backtest(
 
     # Cerrar posición abierta al final del período
     if in_position:
-        exit_price = df.iloc[-1]["close"]
-        date       = df.index[-1]
-        pnl_pct    = (exit_price - entry_price) / entry_price * 100
-        pnl_usdt   = capital * (pnl_pct / 100)
-        capital   += pnl_usdt
+        exit_price    = df.iloc[-1]["close"]
+        date          = df.index[-1]
+        round_trip_cost = (COMMISSION_PCT + SLIPPAGE_PCT) * 2
+        pnl_pct_gross = (exit_price - entry_price) / entry_price * 100
+        pnl_pct       = pnl_pct_gross - round_trip_cost
+        pnl_usdt      = capital * (pnl_pct / 100)
+        capital      += pnl_usdt
 
         trades.append({
             "symbol":         "",
@@ -374,6 +394,7 @@ def run_backtest(
             "razon_entrada":  f"{entry_signal} (score {entry_score})",
             "razon_salida":   "Fin backtest",
             "pnl_pct":        round(pnl_pct, 2),
+            "pnl_pct_gross":  round(pnl_pct_gross, 2),
             "pnl_usdt":       round(pnl_usdt, 4),
             "capital":        round(capital, 4),
             "velas_abierto":  total_rows - 1 - entry_idx,

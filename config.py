@@ -48,3 +48,14 @@ EXCEL_PATH = "crypto_signals.xlsx"
 # Es un path diferente (timeframe distinto) y NO está cubierto por el backtest de 4h.
 SL_ATR_MULT = 1.5
 TP_ATR_MULT = 2.5
+
+# ─── Costos de trading (backtester y simulador de sesión) ────────────────────
+# Binance Spot taker: 0.075% por lado (con BNB o VIP 0).
+# Slippage conservador en 4h: 0.05% (poca urgencia, mercados líquidos).
+# Round-trip total = (comisión + slippage) × 2 lados.
+#
+# Con R/R=1.67 y SL=1.5×ATR, el break-even win-rate SIN costos es 37.5%.
+# Con 0.25% round-trip round-trip, sube a ~40.5% → necesita mayor calidad de señales.
+COMMISSION_PCT      = 0.075   # % por lado (Binance taker fee)
+SLIPPAGE_PCT        = 0.050   # % por lado (estimación conservadora 4h)
+ROUND_TRIP_COST_PCT = (COMMISSION_PCT + SLIPPAGE_PCT) * 2  # total: 0.25%

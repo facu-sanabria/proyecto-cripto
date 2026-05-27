@@ -61,7 +61,8 @@ PRICE_INTERVAL_SEC    = 3    # actualizar precios crypto cada N segundos
 INDICATOR_INTERVAL    = 60   # recalcular indicadores crypto cada N segundos
 STOCKS_PRICE_INTERVAL = 15   # actualizar precios acciones cada 15s (7 req paralelas)
 STOCKS_SIG_INTERVAL   = 180  # recalcular indicadores acciones cada 3 min
-STOCK_NOTIFY_SIGNAL   = "STRONG BUY"  # señal que dispara Telegram + estadísticas
+STOCK_NOTIFY_SIGNAL   = "STRONG BUY"  # señal que dispara alerta Telegram
+STOCK_MIN_SIGNAL      = "BUY"         # señal mínima para abrir posición simulada
 TF_FAST               = "5m"
 TF_SLOW               = "15m"
 CANDLES_FAST          = 100
@@ -228,8 +229,9 @@ def stocks_indicator_updater():
     Dispara Telegram + loguea en trade_log cuando señal = STRONG BUY."""
     global _stocks_state, _ts_stocks, _stocks_loading
     while True:
-        new_stocks     = {}
-        alerts_pending = []   # (sym, data_dict) a notificar tras liberar el lock
+        new_stocks      = {}
+        alerts_pending  = []   # (sym, entry) → Telegram STRONG BUY + abrir posición
+        buy_pending     = []   # (sym, entry) → solo abrir posición (BUY, sin Telegram)
 
         for s in STOCKS:
             sym = s["symbol"]
@@ -249,7 +251,10 @@ def stocks_indicator_updater():
                             "volume_usdt": 0,
                         },
                     }
-                    result = analyze_crypto(input_data)
+                    # adx_threshold=13: ADX en 1h stocks es ~30% más bajo que en 4h
+                    # (mayor ruido intraday). Con threshold=18 la mayoría de señales
+                    # se bloqueaban → nunca aparecían señales de compra.
+                    result = analyze_crypto(input_data, adx_threshold=13)
 
                     stop_loss   = result.get("stop_loss")
                     take_profit = result.get("take_profit")
@@ -276,9 +281,13 @@ def stocks_indicator_updater():
                     }
                     new_stocks[sym] = entry
 
-                    # Telegram cuando STRONG BUY
+                    # Telegram: solo STRONG BUY (score ≥ 60)
                     if result["signal"] == STOCK_NOTIFY_SIGNAL and should_notify(sym):
                         alerts_pending.append((sym, entry))
+
+                    # BUY (score ≥ 25): abrir posición simulada sin Telegram
+                    elif result["signal"] == "BUY":
+                        buy_pending.append((sym, entry))
 
                     # Revisar posición abierta de este símbolo contra velas descargadas
                     if df is not None:
@@ -320,6 +329,29 @@ def stocks_indicator_updater():
                             "tp_pct":        round(tp_pct, 3),
                             "ts_entry":      datetime.now(),      # local — sólo display
                             "ts_entry_unix": time.time(),         # UTC unix — para comparar velas
+                            "tf":            "1h",
+                        }
+
+            # Abrir posiciones BUY (sin Telegram) dentro del lock
+            for sym, entry in buy_pending:
+                if sym not in _state["positions"]:
+                    price      = entry["price"]
+                    stop_loss  = entry.get("stop_loss")
+                    take_profit = entry.get("take_profit")
+                    if stop_loss and take_profit:
+                        sl_pct = (price - stop_loss)   / price * 100
+                        tp_pct = (take_profit - price) / price * 100
+                        _state["positions"][sym] = {
+                            "sym":           sym,
+                            "name":          entry["name"],
+                            "type":          "stock",
+                            "entry":         price,
+                            "sl":            stop_loss,
+                            "tp":            take_profit,
+                            "sl_pct":        round(sl_pct, 3),
+                            "tp_pct":        round(tp_pct, 3),
+                            "ts_entry":      datetime.now(),
+                            "ts_entry_unix": time.time(),
                             "tf":            "1h",
                         }
 

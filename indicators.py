@@ -197,6 +197,7 @@ def compute_indicators(window: pd.DataFrame) -> dict:
         "atr_pct":        round((float(atr) / current_price) * 100, 2),
         "volume_ratio":   round(float(volume_ratio),   2),
         "adx":            round(float(adx_s.iloc[-1]),      2),
+        "adx_prev":       round(float(adx_s.iloc[-2]) if len(adx_s) >= 2 else float(adx_s.iloc[-1]), 2),
         "plus_di":        round(float(plus_di_s.iloc[-1]),  2),
         "minus_di":       round(float(minus_di_s.iloc[-1]), 2),
     }
