@@ -206,7 +206,15 @@ def compute_indicators(window: pd.DataFrame) -> dict:
 
 def calculate_indicators(df: pd.DataFrame) -> dict:
     """
-    Calcula indicadores usando todo el DataFrame (modo live / Excel bot).
+    Calcula indicadores usando las últimas INDICATOR_WINDOW velas del DataFrame.
+
+    Usar las últimas INDICATOR_WINDOW velas (no todas) garantiza paridad exacta
+    con calculate_indicators_at: ambas funciones operan sobre la misma cantidad
+    de datos → mismo resultado numérico, sin diferencias de floating point por
+    distintos tamaños de burn-in del EWM.
+
+    En producción get_ohlcv descarga exactamente CANDLES=200 velas, así que
+    este slice es un no-op. En tests con DataFrames más grandes sí tiene efecto.
 
     Args:
         df: DataFrame con columnas open, high, low, close, volume.
@@ -214,6 +222,8 @@ def calculate_indicators(df: pd.DataFrame) -> dict:
     Returns:
         Dict con valores actuales de cada indicador (última vela).
     """
+    if len(df) > INDICATOR_WINDOW:
+        df = df.iloc[-INDICATOR_WINDOW:]
     return compute_indicators(df)
 
 

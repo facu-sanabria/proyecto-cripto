@@ -386,7 +386,7 @@ def _check_crypto_positions() -> None:
             continue
         # Filtrar velas posteriores a la entrada usando Unix epoch (timezone-safe)
         entry_unix = pos["ts_entry_unix"]
-        df_unix    = df.index.astype("int64") // 1_000_000_000
+        df_unix    = df.index.astype("int64") // 1_000_000  # pandas 3.x: µs → s
         post       = df[df_unix > entry_unix]
 
         for ts, row in post.iterrows():
@@ -419,7 +419,7 @@ def _check_stock_position(sym: str, df) -> None:
         return
 
     entry_unix = pos["ts_entry_unix"]
-    df_unix    = df.index.astype("int64") // 1_000_000_000
+    df_unix    = df.index.astype("int64") // 1_000_000  # pandas 3.x: µs → s
     post       = df[df_unix > entry_unix]
 
     fill = None
