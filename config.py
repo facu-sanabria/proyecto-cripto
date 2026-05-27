@@ -37,10 +37,14 @@ EXCEL_PATH = "crypto_signals.xlsx"
 #
 # SL = precio_entrada - SL_ATR_MULT × ATR
 # TP = precio_entrada + TP_ATR_MULT × ATR
-# R/R = TP_ATR_MULT / SL_ATR_MULT = 3.0 / 1.5 = 2.0
-# Break-even WR mínimo = SL_ATR_MULT / (SL_ATR_MULT + TP_ATR_MULT) = 33.3%
+# R/R = TP_ATR_MULT / SL_ATR_MULT = 2.5 / 1.5 = 1.67
+# Break-even WR mínimo = SL_ATR_MULT / (SL_ATR_MULT + TP_ATR_MULT) = 37.5%
+#
+# Elegido por backtest 6 meses (BTC PF=1.65, WR=50% vs PF=1.28, WR=38% con TP=3.0).
+# TP=2.5 cierra ganadores antes de que el precio revierta — más robusto en mercado
+# lateral/volátil. TP=3.0 requiere tendencias largas que son menos frecuentes.
 #
 # NOTA: scalper.py (crypto 5m/15m live) usa SL=1.0×ATR con floor 0.3%.
 # Es un path diferente (timeframe distinto) y NO está cubierto por el backtest de 4h.
 SL_ATR_MULT = 1.5
-TP_ATR_MULT = 3.0
+TP_ATR_MULT = 2.5

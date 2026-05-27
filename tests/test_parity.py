@@ -67,7 +67,7 @@ class TestSLTPMultipliers:
 
     def test_config_values(self):
         assert SL_ATR_MULT == 1.5, f"SL_ATR_MULT debe ser 1.5, es {SL_ATR_MULT}"
-        assert TP_ATR_MULT == 3.0, f"TP_ATR_MULT debe ser 3.0, es {TP_ATR_MULT}"
+        assert TP_ATR_MULT == 2.5, f"TP_ATR_MULT debe ser 2.5, es {TP_ATR_MULT}"
 
     def test_backtester_aliases(self):
         import backtester
