@@ -358,6 +358,10 @@ def run_backtest(
             else:
                 entry_price = close  # última vela del período
 
+            # SL/TP basados en entry_price (no en close de la señal).
+            # Si hay gap entre close y next open, el R/R se invierte cuando se usa close:
+            #   close=100, ATR=1, next_open=101 → SL_dist=2.5, TP_dist=1.5 (R/R=0.6 ← MALO)
+            # Con entry_price: SL_dist=1.5×ATR, TP_dist=2.5×ATR → R/R=1.67 (correcto).
             stop_loss   = entry_price - SL_MULTIPLIER * atr
             take_profit = entry_price + TP_MULTIPLIER * atr
             highest_since_entry = entry_price

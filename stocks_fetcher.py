@@ -79,26 +79,9 @@ def get_stock_ohlcv(
             interval = "1d"
 
     try:
-        import requests as _req
-        from requests.adapters import HTTPAdapter as _HTTPAdapter
-
-        # HTTPAdapter con timeout real en el socket — el único timeout que
-        # funciona en Python sin multiprocessing. Si Yahoo no responde en
-        # CONNECT_TIMEOUT segundos, lanza requests.exceptions.Timeout.
-        CONNECT_TIMEOUT = 15  # segundos para establecer conexión
-        READ_TIMEOUT    = 20  # segundos esperando respuesta
-
-        class _TimeoutAdapter(_HTTPAdapter):
-            def send(self, *args, **kwargs):
-                kwargs["timeout"] = (CONNECT_TIMEOUT, READ_TIMEOUT)
-                return super().send(*args, **kwargs)
-
-        session = _req.Session()
-        session.mount("https://", _TimeoutAdapter())
-        session.mount("http://",  _TimeoutAdapter())
-
-        ticker = yf.Ticker(symbol, session=session)
-
+        # yf.download() es más robusto ante rate limits que yf.Ticker().history()
+        # porque no necesita el flujo separado de cookie/crumb que Yahoo bloquea
+        # con mayor frecuencia. Referencia: yfinance issue #2066.
         if start_dt and end_dt:
             yf_kwargs = dict(start=start_dt, end=end_dt, interval=interval)
         elif start_dt:
@@ -109,10 +92,15 @@ def get_stock_ohlcv(
             period = next((v for k, v in sorted(period_map.items()) if months <= k), "5y")
             yf_kwargs = dict(period=period, interval=interval)
 
-        df = ticker.history(**yf_kwargs)
+        df = yf.download(symbol, progress=False, auto_adjust=True, **yf_kwargs)
 
         if df.empty:
             return None
+
+        # yf.download devuelve MultiIndex cuando se pasa una lista; para un solo
+        # símbolo puede devolver columnas simples o MultiIndex según versión.
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
         # Normalizar nombres de columnas
         df.columns = [c.lower() for c in df.columns]
