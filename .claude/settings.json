@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Users\\Facundo\\AppData\\Local\\Programs\\Python\\Python313\\python.exe .claude\\hooks\\post_edit_pytest.py"
+          }
+        ]
+      }
+    ]
+  }
+}
