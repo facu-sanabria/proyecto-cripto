@@ -66,7 +66,13 @@ TF_FAST               = "5m"
 TF_SLOW               = "15m"
 CANDLES_FAST          = 100
 CANDLES_SLOW          = 60
-TRADE_LOG_COOLDOWN    = 90 * 60  # no re-loguear misma crypto en 90 min
+TRADE_LOG_COOLDOWN    = 90 * 60  # no re-loguear misma crypto en 90 min  [LEGACY — reemplazado por positions]
+
+# Costos por operación (se descuentan al cerrar cada posición)
+# Binance taker spot: 0.10% por lado | slippage conservador: 0.05% por lado
+COMMISSION_PCT      = 0.10   # % por lado
+SLIPPAGE_PCT        = 0.05   # % por lado  (estimación conservadora)
+ROUND_TRIP_COST_PCT = (COMMISSION_PCT + SLIPPAGE_PCT) * 2  # total round-trip
 
 # Acciones — análisis en 1h (swing/posición, NO scalping)
 # Yahoo Finance gratis tiene 15 min de delay: no apto para scalping en 5m
@@ -90,8 +96,10 @@ _state = {
     "ts_prices":       None,
     "ts_signals":      None,
     "loading":         True,
-    "trade_log":       [],   # historial de señales COMPRAR para estadísticas
-    "trade_logged_at": {},   # sym → float (time.time()) del último log
+    # ── Simulador de sesión (reemplaza trade_log) ─────────────────────────
+    # Máximo UNA posición por símbolo. Cerradas por toque de SL/TP en velas.
+    "positions":      {},   # sym → posición abierta (ver _open_position)
+    "closed_trades":  [],   # operaciones cerradas con PnL realizado (neto de costos)
 }
 
 # Estado de acciones — dos capas: precios rápidos + análisis lento
@@ -167,27 +175,36 @@ def indicator_updater():
                 pass
             time.sleep(0.2)   # pequeño delay entre descargas
 
+        # Revisar posiciones crypto abiertas ANTES de tomar el lock
+        # (descarga velas 5m — no bloquear UI durante la red)
+        _check_crypto_positions()
+
         with _lock:
             _state["signals"].update(new_sigs)
             _state["change_24h"].update(changes)
             _state["ts_signals"] = datetime.now()
             _state["loading"]    = False
 
-            # ── Trade log: registrar señales COMPRAR para estadísticas ──────
-            now_ts = time.time()
+            # ── Abrir posición si hay señal COMPRAR y no hay una ya abierta ──
             for sym, sig in new_sigs.items():
                 if sig.get("signal") == "COMPRAR":
-                    last_logged = _state["trade_logged_at"].get(sym, 0)
-                    if (now_ts - last_logged) >= TRADE_LOG_COOLDOWN:
-                        _state["trade_log"].append({
-                            "sym":     sym,
-                            "name":    sig["name"],
-                            "entry":   sig["price"],
-                            "sl_pct":  sig["sl_pct"],
-                            "tp1_pct": sig["tp1_pct"],
-                            "ts":      datetime.now(),
-                        })
-                        _state["trade_logged_at"][sym] = now_ts
+                    if sym not in _state["positions"]:
+                        entry   = sig["price"]
+                        sl_pct  = sig["sl_pct"]
+                        tp1_pct = sig["tp1_pct"]
+                        _state["positions"][sym] = {
+                            "sym":            sym,
+                            "name":           sig["name"],
+                            "type":           "crypto",
+                            "entry":          entry,
+                            "sl":             entry * (1 - sl_pct  / 100),
+                            "tp":             entry * (1 + tp1_pct / 100),
+                            "sl_pct":         sl_pct,
+                            "tp_pct":         tp1_pct,
+                            "ts_entry":       datetime.now(),       # local — sólo display
+                            "ts_entry_unix":  time.time(),          # UTC unix — para comparar velas
+                            "tf":             TF_FAST,
+                        }
 
         time.sleep(INDICATOR_INTERVAL)
 
@@ -258,9 +275,13 @@ def stocks_indicator_updater():
                     }
                     new_stocks[sym] = entry
 
-                    # Telegram + trade_log cuando STRONG BUY
+                    # Telegram cuando STRONG BUY
                     if result["signal"] == STOCK_NOTIFY_SIGNAL and should_notify(sym):
                         alerts_pending.append((sym, entry))
+
+                    # Revisar posición abierta de este símbolo contra velas descargadas
+                    if df is not None:
+                        _check_stock_position(sym, df)
 
                 elif price:
                     new_stocks[sym] = {
@@ -273,26 +294,33 @@ def stocks_indicator_updater():
                 pass
             time.sleep(0.5)
 
-        # ── Actualizar estado + loguear trades (con lock) ──────────────────────
-        now_ts = time.time()
+        # ── Actualizar estado + abrir nuevas posiciones (con lock) ────────────
         with _lock:
             _stocks_state.update(new_stocks)
             _ts_stocks      = datetime.now()
             _stocks_loading = False
 
             for sym, entry in alerts_pending:
-                last_logged = _state["trade_logged_at"].get(sym, 0)
-                if (now_ts - last_logged) >= TRADE_LOG_COOLDOWN:
-                    _state["trade_log"].append({
-                        "sym":     sym,
-                        "name":    entry["name"],
-                        "entry":   entry["price"],
-                        "sl_pct":  entry["sl_pct"],
-                        "tp1_pct": entry["tp1_pct"],
-                        "ts":      datetime.now(),
-                        "type":    "stock",
-                    })
-                    _state["trade_logged_at"][sym] = now_ts
+                if sym not in _state["positions"]:
+                    price      = entry["price"]
+                    stop_loss  = entry.get("stop_loss")
+                    take_profit = entry.get("take_profit")
+                    if stop_loss and take_profit:
+                        sl_pct = (price - stop_loss)    / price * 100
+                        tp_pct = (take_profit - price)  / price * 100
+                        _state["positions"][sym] = {
+                            "sym":           sym,
+                            "name":          entry["name"],
+                            "type":          "stock",
+                            "entry":         price,
+                            "sl":            stop_loss,
+                            "tp":            take_profit,
+                            "sl_pct":        round(sl_pct, 3),
+                            "tp_pct":        round(tp_pct, 3),
+                            "ts_entry":      datetime.now(),      # local — sólo display
+                            "ts_entry_unix": time.time(),         # UTC unix — para comparar velas
+                            "tf":            "1h",
+                        }
 
         # ── Mandar Telegram fuera del lock ─────────────────────────────────────
         for sym, entry in alerts_pending:
@@ -300,6 +328,114 @@ def stocks_indicator_updater():
                 _send_stock_alert(sym, entry)
 
         time.sleep(STOCKS_SIG_INTERVAL)
+
+
+# ─── Simulador de posiciones ──────────────────────────────────────────────────
+# Las funciones _close_position, _check_crypto_positions y _check_stock_position
+# deben llamarse sin el lock (toman el lock internamente).
+
+def _close_position(sym: str, exit_px: float, reason: str, ts_exit) -> None:
+    """
+    Cierra una posición, calcula PnL neto descontando comisión + slippage,
+    y la mueve a closed_trades.
+
+    Debe llamarse CON _lock ya tomado por el caller.
+    """
+    pos = _state["positions"].pop(sym, None)
+    if pos is None:
+        return
+    pnl_gross = (exit_px - pos["entry"]) / pos["entry"] * 100
+    pnl_net   = pnl_gross - ROUND_TRIP_COST_PCT
+    _state["closed_trades"].append({
+        **pos,
+        "exit":      round(float(exit_px), 8),
+        "pnl_gross": round(pnl_gross, 3),
+        "pnl_net":   round(pnl_net, 3),
+        "result":    "WIN" if pnl_net >= 0 else "LOSS",
+        "reason":    reason,
+        "ts_exit":   ts_exit,
+    })
+
+
+def _check_crypto_positions() -> None:
+    """
+    Revisa posiciones crypto abiertas buscando el PRIMER toque de SL o TP
+    en velas de 5m. Descarga velas sin lock; aplica resultados con lock.
+
+    Limitaciones de precisión (documentadas):
+    - Resolución de 5m: fills intrabar no distinguibles.
+    - Si SL y TP se tocan en la misma vela, asume SL (worst-case conservador).
+    - Sin datos tick-a-tick: aproximación de fill, no ejecución real.
+    - Timestamps en UTC (Binance) vs local time: comparación via Unix epoch.
+    """
+    # 1. Snapshot de posiciones bajo lock
+    with _lock:
+        to_check = {
+            s: dict(p) for s, p in _state["positions"].items()
+            if p.get("type") == "crypto"
+        }
+
+    if not to_check:
+        return
+
+    # 2. Descargar velas y detectar fills (sin lock — red I/O)
+    fills = {}  # sym → (reason, exit_px, ts_fill)
+    for sym, pos in to_check.items():
+        df = get_ohlcv(sym, "5m", 100)  # ~8h de cobertura
+        if df is None:
+            continue
+        # Filtrar velas posteriores a la entrada usando Unix epoch (timezone-safe)
+        entry_unix = pos["ts_entry_unix"]
+        df_unix    = df.index.astype("int64") // 1_000_000_000
+        post       = df[df_unix > entry_unix]
+
+        for ts, row in post.iterrows():
+            sl_hit = row["low"]  <= pos["sl"]
+            tp_hit = row["high"] >= pos["tp"]
+            if sl_hit:  # SL tiene prioridad ante ambos en misma vela (worst-case)
+                fills[sym] = ("Stop-Loss",   pos["sl"], ts)
+                break
+            elif tp_hit:
+                fills[sym] = ("Take-Profit", pos["tp"], ts)
+                break
+
+    # 3. Aplicar fills bajo lock
+    if fills:
+        with _lock:
+            for sym, (reason, exit_px, ts) in fills.items():
+                _close_position(sym, exit_px, reason, ts)
+
+
+def _check_stock_position(sym: str, df) -> None:
+    """
+    Revisa una posición de acción usando el DataFrame descargado de Yahoo Finance.
+    Yahoo tiene 15min de delay: fill aproximado, no real.
+    Diseñado para llamarse desde stocks_indicator_updater (sin lock).
+    """
+    with _lock:
+        pos = _state["positions"].get(sym)
+
+    if pos is None or pos.get("type") != "stock":
+        return
+
+    entry_unix = pos["ts_entry_unix"]
+    df_unix    = df.index.astype("int64") // 1_000_000_000
+    post       = df[df_unix > entry_unix]
+
+    fill = None
+    for ts, row in post.iterrows():
+        sl_hit = row["low"]  <= pos["sl"]
+        tp_hit = row["high"] >= pos["tp"]
+        if sl_hit:
+            fill = ("Stop-Loss",   pos["sl"], ts)
+            break
+        elif tp_hit:
+            fill = ("Take-Profit", pos["tp"], ts)
+            break
+
+    if fill:
+        with _lock:
+            _close_position(sym, fill[1], fill[0], fill[2])
 
 
 def _send_scalp_alert(symbol: str, sig: dict):
@@ -738,102 +874,119 @@ def build_tips() -> Panel:
 
 
 def build_stats_panel() -> Panel:
-    """Panel de estadísticas de sesión: crypto COMPRAR + stocks STRONG BUY."""
+    """
+    Panel de estadísticas de sesión — simulación de fills fiel por posición.
+
+    Muestra:
+    - CERRADAS: resultado real (primera vela que toca SL o TP) con PnL neto de costos.
+    - ABIERTAS: PnL flotante no realizado (precio actual vs entrada).
+    - Acumulado: SOLO PnL realizado de cerradas (con comisión + slippage descontados).
+
+    Limitaciones documentadas:
+    - Resolución de 5m para crypto: fills intrabar no distinguibles.
+    - Stocks: Yahoo Finance con 15min de delay.
+    - Sin tick-a-tick: aproximación, no ejecución real.
+    """
     with _lock:
-        log        = list(_state["trade_log"])
-        crypto_px  = dict(_state["prices"])
-        stocks_px  = dict(_stocks_prices)   # (price, change_pct) por símbolo
+        positions     = dict(_state["positions"])
+        closed_trades = list(_state["closed_trades"])
+        crypto_px     = dict(_state["prices"])
+        stocks_px     = dict(_stocks_prices)
 
-    title = "[bold white] 📊 ESTADÍSTICAS DE SESIÓN [/]"
+    title     = "[bold white] 📊 ESTADÍSTICAS DE SESIÓN [/]"
+    cost_note = (
+        f"[dim]costos: {COMMISSION_PCT:.2f}%+{SLIPPAGE_PCT:.2f}% × 2 "
+        f"= {ROUND_TRIP_COST_PCT:.2f}% round-trip | "
+        f"fills: 1ª vela 5m que toca SL/TP (no tick a tick)[/]"
+    )
 
-    if not log:
-        msg = (
-            "[dim]Sin operaciones registradas aún.  "
-            "Crypto COMPRAR y Acciones STRONG BUY se registran aquí automáticamente.[/]"
-        )
+    if not positions and not closed_trades:
         return Panel(
-            Align.center(msg, vertical="middle"),
-            title=title,
-            border_style="steel_blue1",
-            height=3,
+            Align.center(
+                "[dim]Sin operaciones. Crypto COMPRAR → 🪙 | Stocks STRONG BUY → 📈[/]\n" + cost_note,
+                vertical="middle",
+            ),
+            title=title, border_style="steel_blue1", height=4,
         )
 
-    wins = losses = open_ = 0
-    accum_pct = 0.0
+    wins = losses = 0
+    realized_pct  = 0.0
     rows = []
 
-    for trade in log:
-        sym      = trade["sym"]
-        name     = trade["name"]
-        entry    = trade["entry"]
-        sl_pct   = trade["sl_pct"]
-        tp1_pct  = trade["tp1_pct"]
-        ts       = trade["ts"]
-        is_stock = trade.get("type") == "stock"
+    # ── Cerradas ─────────────────────────────────────────────────────────────
+    for trade in closed_trades:
+        if trade["result"] == "WIN":
+            wins += 1
+            result_t = Text(f"✓ WIN  ({trade['pnl_net']:+.2f}% neto)", style="bold green")
+        else:
+            losses += 1
+            result_t = Text(f"✗ LOSS ({trade['pnl_net']:+.2f}% neto)", style="bold red")
+        realized_pct += trade["pnl_net"]
+        type_tag = Text("📈" if trade["type"] == "stock" else "🪙",
+                        style="magenta" if trade["type"] == "stock" else "cyan")
+        rows.append((
+            type_tag, trade["name"],
+            trade["ts_entry"].strftime("%H:%M"),
+            fmt_price(trade["entry"]),
+            fmt_price(trade["exit"]),
+            result_t,
+        ))
 
-        # Precio actual: distintas fuentes según tipo
-        if is_stock:
+    # ── Abiertas ──────────────────────────────────────────────────────────────
+    unrealized_pct = 0.0
+    open_count     = 0
+    for sym, pos in positions.items():
+        if pos["type"] == "stock":
             fp      = stocks_px.get(sym)
-            current = fp[0] if fp else entry
+            current = fp[0] if fp else pos["entry"]
         else:
-            current = crypto_px.get(sym, entry)
+            current = crypto_px.get(sym, pos["entry"])
 
-        tp1_price = entry * (1 + tp1_pct / 100)
-        sl_price  = entry * (1 - sl_pct  / 100)
-        pct_now   = (current - entry) / entry * 100
+        floating = (current - pos["entry"]) / pos["entry"] * 100
+        unrealized_pct += floating
+        open_count     += 1
 
-        if current >= tp1_price:
-            result_t   = Text(f"✓ WIN  (+{tp1_pct:.1f}%)", style="bold green")
-            accum_pct += tp1_pct
-            wins      += 1
-        elif current <= sl_price:
-            result_t   = Text(f"✗ LOSS (-{sl_pct:.1f}%)", style="bold red")
-            accum_pct -= sl_pct
-            losses    += 1
-        else:
-            col      = "green" if pct_now >= 0 else "red"
-            result_t = Text(f"● OPEN ({pct_now:+.2f}%)", style=col)
-            open_   += 1
-
-        # Etiqueta de tipo
-        type_tag = Text("📈", style="magenta") if is_stock else Text("🪙", style="cyan")
-        rows.append((type_tag, name, ts.strftime("%H:%M"), fmt_price(entry), fmt_price(current), result_t))
+        col      = "green" if floating >= 0 else "red"
+        result_t = Text(f"● OPEN ({floating:+.2f}% float)", style=col)
+        type_tag = Text("📈" if pos["type"] == "stock" else "🪙",
+                        style="magenta" if pos["type"] == "stock" else "cyan")
+        rows.append((
+            type_tag, pos["name"],
+            pos["ts_entry"].strftime("%H:%M"),
+            fmt_price(pos["entry"]),
+            fmt_price(current),
+            result_t,
+        ))
 
     closed   = wins + losses
-    win_rate = (wins / closed * 100) if closed > 0 else 0.0
-    acc_col  = "green" if accum_pct >= 0 else "red"
+    wr       = (wins / closed * 100) if closed > 0 else 0.0
+    acc_col  = "green" if realized_pct  >= 0 else "red"
+    ur_col   = "green" if unrealized_pct >= 0 else "red"
 
-    # Línea de resumen
     summary = (
-        f"  [bold white]Operaciones:[/] {len(log)}   "
-        f"[bold green]✓ Ganadas: {wins}[/]   "
-        f"[bold red]✗ Perdidas: {losses}[/]   "
-        f"[yellow]● Abiertas: {open_}[/]   "
-        f"[dim]│[/]   "
-        f"[white]Win Rate: [bold]{win_rate:.0f}%[/][/]   "
-        f"[white]Ganancia acumulada: [{acc_col} bold]{accum_pct:+.2f}%[/][/]"
+        f"  [bold white]Cerradas:[/] {closed}  "
+        f"[bold green]✓ {wins}[/]  "
+        f"[bold red]✗ {losses}[/]  "
+        f"[yellow]● Abiertas: {open_count}[/]  [dim]│[/]  "
+        f"[white]Win Rate: [bold]{wr:.0f}%[/][/]  [dim]│[/]  "
+        f"[white]Realizado: [{acc_col} bold]{realized_pct:+.2f}%[/]  "
+        f"No realizado: [{ur_col}]{unrealized_pct:+.2f}%[/][/]"
     )
 
-    # Tabla de operaciones individuales
-    tbl = Table(
-        box=box.SIMPLE,
-        show_header=True,
-        header_style="dim white",
-        expand=True,
-        padding=(0, 1),
-    )
-    tbl.add_column("",         width=2,  justify="center")          # tipo 🪙/📈
-    tbl.add_column("PAR",      width=6,  justify="left",  style="cyan")
-    tbl.add_column("HORA",     width=6,  justify="center", style="dim")
-    tbl.add_column("ENTRADA",  width=13, justify="right")
-    tbl.add_column("ACTUAL",   width=13, justify="right")
-    tbl.add_column("RESULTADO",width=20, justify="left")
+    tbl = Table(box=box.SIMPLE, show_header=True, header_style="dim white",
+                expand=True, padding=(0, 1))
+    tbl.add_column("",           width=2,  justify="center")
+    tbl.add_column("PAR",        width=8,  justify="left", style="cyan")
+    tbl.add_column("HORA",       width=6,  justify="center", style="dim")
+    tbl.add_column("ENTRADA",    width=13, justify="right")
+    tbl.add_column("ACTUAL/EXIT",width=13, justify="right")
+    tbl.add_column("RESULTADO",  width=24, justify="left")
 
     for type_tag, name, ts_str, entry_str, curr_str, result_t in rows:
         tbl.add_row(type_tag, name, ts_str, entry_str, curr_str, result_t)
 
     return Panel(
-        Group(Text.from_markup(summary), tbl),
+        Group(Text.from_markup(summary), Text.from_markup("  " + cost_note), tbl),
         title=title,
         border_style="steel_blue1",
         padding=(0, 0),
