@@ -77,16 +77,22 @@ ROUND_TRIP_COST_PCT = (COMMISSION_PCT + SLIPPAGE_PCT) * 2  # total round-trip
 
 # Acciones — análisis en 1h (swing/posición, NO scalping)
 # Yahoo Finance gratis tiene 15 min de delay: no apto para scalping en 5m
+#
+# Seleccionadas por mega_backtest.py (17 activos × 3m/6m/12m, con costos reales):
+#   NVDA:  PF=1.29, mejor en 3m. Abrir posiciones en BUY/STRONG BUY.
+#   GOOGL: PF=1.19, consistente en 6m y 12m (+15.4% en 12m). Abrir posiciones.
+#   SPY:   PF=0.64, NO operar. Solo como referencia del mercado general (sin posición).
+#
+# Eliminados: AAPL (PF=0.66), MSFT (PF=0.35), META (PF=0.33), QQQ (PF=0.88), GLD (PF=0.66)
 STOCKS = [
-    {"symbol": "NVDA",  "name": "NVIDIA",    "type": "stock"},
-    {"symbol": "SPY",   "name": "S&P 500",   "type": "etf"},
-    {"symbol": "AAPL",  "name": "Apple",     "type": "stock"},
-    {"symbol": "MSFT",  "name": "Microsoft", "type": "stock"},
-    {"symbol": "GOOGL", "name": "Google",    "type": "stock"},
-    {"symbol": "META",  "name": "Meta",      "type": "stock"},
-    {"symbol": "QQQ",   "name": "Nasdaq100", "type": "etf"},
-    {"symbol": "GLD",   "name": "Gold ETF",  "type": "commodity"},
+    {"symbol": "NVDA",  "name": "NVIDIA",  "type": "stock"},   # ✅ operar
+    {"symbol": "GOOGL", "name": "Google",  "type": "stock"},   # ✅ operar
+    {"symbol": "SPY",   "name": "S&P 500", "type": "etf",
+     "no_trade": True},  # solo referencia mercado — no abrir posiciones
 ]
+
+# Símbolos donde NO abrir posición (solo monitoring)
+STOCKS_NO_TRADE = {s["symbol"] for s in STOCKS if s.get("no_trade")}
 
 # ─── Estado compartido ────────────────────────────────────────────────────────
 _lock  = threading.Lock()
@@ -281,13 +287,15 @@ def stocks_indicator_updater():
                     }
                     new_stocks[sym] = entry
 
-                    # Telegram: solo STRONG BUY (score ≥ 60)
-                    if result["signal"] == STOCK_NOTIFY_SIGNAL and should_notify(sym):
-                        alerts_pending.append((sym, entry))
+                    # Solo operar activos en cartera (no los de referencia como SPY)
+                    if sym not in STOCKS_NO_TRADE:
+                        # Telegram: solo STRONG BUY (score ≥ 60)
+                        if result["signal"] == STOCK_NOTIFY_SIGNAL and should_notify(sym):
+                            alerts_pending.append((sym, entry))
 
-                    # BUY (score ≥ 25): abrir posición simulada sin Telegram
-                    elif result["signal"] == "BUY":
-                        buy_pending.append((sym, entry))
+                        # BUY (score ≥ 25): abrir posición simulada sin Telegram
+                        elif result["signal"] == "BUY":
+                            buy_pending.append((sym, entry))
 
                     # Revisar posición abierta de este símbolo contra velas descargadas
                     if df is not None:

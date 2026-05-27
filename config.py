@@ -6,9 +6,13 @@
 # Lista de criptomonedas a analizar
 # "symbol" es el par de trading en Binance (siempre termina en USDT)
 # "name"   es el nombre amigable para mostrar en el Excel
-# Cartera core — seleccionados por backtest 2024:
-#   BTC: PF 1.59, +44.1%, 47 trades (mayor muestra estadística crypto)
-#   SOL: PF 1.35, +44.8%, 39 trades (mejor altcoin en bulls)
+#
+# Cartera seleccionada por mega_backtest.py (17 activos × 3m/6m/12m, con costos):
+#   BTC:  PF=1.21, WR=46%, Ret.prom=+5.0%,  Consistencia 100% (3/3 períodos > 1.0)
+#   SOL:  PF=1.25, WR=48%, Ret.prom=+10.1%, Consistencia 100% — 12m: +26.2%
+#
+# Descartados: ETH (PF=0.54), XRP (PF=0.43), ADA (PF=0.73), AVAX (PF=0.58),
+#              BNB (0% sin pérdidas pero inconsistente), DOGE/LINK marginales.
 CRYPTOS = [
     {"symbol": "BTCUSDT", "name": "Bitcoin"},
     {"symbol": "SOLUSDT", "name": "Solana"},

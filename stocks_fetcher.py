@@ -39,10 +39,15 @@ STOCKS = [
     {"symbol": "SLV",   "name": "Silver ETF",  "type": "commodity"},
 ]
 
-# Cartera core — seleccionados por backtest 2024:
-#   NVDA: PF 3.63, +77.7%, 70% WR  (mejor activo del dataset)
-#   SPY:  PF 2.80, +16.2%, 54% WR  (ultra-consistente, low DD 3.2%)
-STOCKS_CORE = [s for s in STOCKS if s["symbol"] in ("NVDA", "SPY")]
+# Cartera core — seleccionados por mega_backtest.py (17 activos × 3m/6m/12m, con costos):
+#   NVDA:  PF=1.29, WR=50%, 67% consistencia — mejor stock individual (3m: +6.7%)
+#   GOOGL: PF=1.19, WR=48%, 67% consistencia — 12m: +15.4%, PF12m=1.37
+#
+# Descartados: SPY (PF=0.64, 0% consistencia), QQQ (PF=0.88),
+#              AAPL (PF=0.66), MSFT (PF=0.35), META (PF=0.33), GLD (PF=0.66).
+# Nota: NVDA inconsistente entre períodos (3m excelente, 12m negativo).
+#       Monitorear si el patrón de 3m se mantiene antes de aumentar posición.
+STOCKS_CORE = [s for s in STOCKS if s["symbol"] in ("NVDA", "GOOGL")]
 
 # ─── Descarga de datos históricos ─────────────────────────────────────────────
 
