@@ -569,12 +569,23 @@ def main():
                         help="Salir cuando MACD cruza negativo estando en profit (deja correr tendencias)")
     parser.add_argument("--no-fg",       action="store_true",
                         help="Desactivar filtro Fear & Greed histórico")
+    parser.add_argument("--sl-mult",    type=float, default=None,
+                        help=f"Override SL multiplier ATR (default: config={SL_ATR_MULT})")
+    parser.add_argument("--tp-mult",    type=float, default=None,
+                        help=f"Override TP multiplier ATR (default: config={TP_ATR_MULT})")
     args = parser.parse_args()
 
     use_trailing   = args.trailing
     use_breakeven  = args.breakeven
     use_macd_exit  = args.macd_exit
     use_fg         = not args.no_fg
+
+    # Overrides de multiplicadores: permiten comparar configs sin tocar config.py
+    global SL_MULTIPLIER, TP_MULTIPLIER
+    if args.sl_mult is not None:
+        SL_MULTIPLIER = args.sl_mult
+    if args.tp_mult is not None:
+        TP_MULTIPLIER = args.tp_mult
 
     # ── Parsear fechas ──────────────────────────────────────────────────────────
     start_dt = None
