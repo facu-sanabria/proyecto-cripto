@@ -84,6 +84,7 @@ STOCKS = [
     {"symbol": "GOOGL", "name": "Google",    "type": "stock"},
     {"symbol": "META",  "name": "Meta",      "type": "stock"},
     {"symbol": "QQQ",   "name": "Nasdaq100", "type": "etf"},
+    {"symbol": "GLD",   "name": "Gold ETF",  "type": "commodity"},
 ]
 
 # ─── Estado compartido ────────────────────────────────────────────────────────
