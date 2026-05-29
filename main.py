@@ -14,12 +14,20 @@ Cómo correr:  python main.py
 
 import sys
 import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", line_buffering=True)
+
+
+def _force_utf8_streams():
+    """Fuerza UTF-8 en stdout/stderr (emojis en consola Windows).
+    Vive en una función — al nivel de módulo rompía importar main.py en tests
+    (envolvía/cerraba el stream capturado por pytest). Se llama desde main()."""
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", line_buffering=True)
+
 
 import time
 import threading
 import requests
+import pandas as pd
 from datetime import datetime
 
 from rich.live    import Live
@@ -32,7 +40,7 @@ from rich         import box
 
 from fetcher        import get_ohlcv
 from scalper        import analyze_scalp, fmt_price
-from notifier       import send_telegram, should_notify
+from notifier       import send_telegram, should_notify, mark_notified
 from stocks_fetcher import fetch_stocks_all, get_stock_ohlcv_v8, get_stocks_prices_bulk
 from analyzer       import analyze_crypto
 
@@ -177,7 +185,8 @@ def indicator_updater():
 
                     # Telegram: alertar solo señales fuertes de compra
                     if sig["signal"] == "COMPRAR" and should_notify(sym):
-                        _send_scalp_alert(sym, sig)
+                        if _send_scalp_alert(sym, sig):
+                            mark_notified(sym)   # activa cooldown (evita spam)
 
             except Exception:
                 pass
@@ -366,7 +375,8 @@ def stocks_indicator_updater():
         # ── Mandar Telegram fuera del lock ─────────────────────────────────────
         for sym, entry in alerts_pending:
             if should_notify(sym):
-                _send_stock_alert(sym, entry)
+                if _send_stock_alert(sym, entry):
+                    mark_notified(sym)   # activa cooldown (evita spam)
 
         time.sleep(STOCKS_SIG_INTERVAL)
 
@@ -375,19 +385,23 @@ def stocks_indicator_updater():
 # Las funciones _close_position, _check_crypto_positions y _check_stock_position
 # deben llamarse sin el lock (toman el lock internamente).
 
-def _close_position(sym: str, exit_px: float, reason: str, ts_exit) -> None:
+def _close_position(sym: str, exit_px: float, reason: str, ts_exit) -> dict | None:
     """
     Cierra una posición, calcula PnL neto descontando comisión + slippage,
     y la mueve a closed_trades.
 
     Debe llamarse CON _lock ya tomado por el caller.
+
+    Returns:
+        El dict del trade cerrado (para notificar fuera del lock), o None si
+        no existía la posición.
     """
     pos = _state["positions"].pop(sym, None)
     if pos is None:
-        return
+        return None
     pnl_gross = (exit_px - pos["entry"]) / pos["entry"] * 100
     pnl_net   = pnl_gross - ROUND_TRIP_COST_PCT
-    _state["closed_trades"].append({
+    trade = {
         **pos,
         "exit":      round(float(exit_px), 8),
         "pnl_gross": round(pnl_gross, 3),
@@ -395,7 +409,9 @@ def _close_position(sym: str, exit_px: float, reason: str, ts_exit) -> None:
         "result":    "WIN" if pnl_net >= 0 else "LOSS",
         "reason":    reason,
         "ts_exit":   ts_exit,
-    })
+    }
+    _state["closed_trades"].append(trade)
+    return trade
 
 
 def _check_crypto_positions() -> None:
@@ -425,10 +441,12 @@ def _check_crypto_positions() -> None:
         df = get_ohlcv(sym, "5m", 100)  # ~8h de cobertura
         if df is None:
             continue
-        # Filtrar velas posteriores a la entrada usando Unix epoch (timezone-safe)
-        entry_unix = pos["ts_entry_unix"]
-        df_unix    = df.index.astype("int64") // 1_000_000  # pandas 3.x: µs → s
-        post       = df[df_unix > entry_unix]
+        # Filtrar velas posteriores a la entrada comparando datetime vs datetime.
+        # entry_unix es Unix epoch en SEGUNDOS (time.time()). El dtype del índice
+        # varía por fuente (crypto=[ms], stocks=[s]) — comparar enteros tras
+        # astype era frágil. pd.Timestamp(.., unit="s") vs df.index es inmune.
+        entry_ts = pd.Timestamp(int(pos["ts_entry_unix"]), unit="s")
+        post     = df[df.index > entry_ts]
 
         for ts, row in post.iterrows():
             sl_hit = row["low"]  <= pos["sl"]
@@ -440,11 +458,16 @@ def _check_crypto_positions() -> None:
                 fills[sym] = ("Take-Profit", pos["tp"], ts)
                 break
 
-    # 3. Aplicar fills bajo lock
+    # 3. Aplicar fills bajo lock; notificar fuera del lock (red I/O)
     if fills:
+        closed = []
         with _lock:
             for sym, (reason, exit_px, ts) in fills.items():
-                _close_position(sym, exit_px, reason, ts)
+                trade = _close_position(sym, exit_px, reason, ts)
+                if trade:
+                    closed.append(trade)
+        for trade in closed:
+            _send_close_alert(trade)
 
 
 def _check_stock_position(sym: str, df) -> None:
@@ -459,9 +482,10 @@ def _check_stock_position(sym: str, df) -> None:
     if pos is None or pos.get("type") != "stock":
         return
 
-    entry_unix = pos["ts_entry_unix"]
-    df_unix    = df.index.astype("int64") // 1_000_000  # pandas 3.x: µs → s
-    post       = df[df_unix > entry_unix]
+    # Comparar datetime vs datetime — inmune a la resolución del índice
+    # (Yahoo v8 = datetime64[s]). entry_unix está en segundos Unix.
+    entry_ts = pd.Timestamp(int(pos["ts_entry_unix"]), unit="s")
+    post     = df[df.index > entry_ts]
 
     fill = None
     for ts, row in post.iterrows():
@@ -476,11 +500,13 @@ def _check_stock_position(sym: str, df) -> None:
 
     if fill:
         with _lock:
-            _close_position(sym, fill[1], fill[0], fill[2])
+            trade = _close_position(sym, fill[1], fill[0], fill[2])
+        _send_close_alert(trade)
 
 
-def _send_scalp_alert(symbol: str, sig: dict):
-    """Formatea y manda alerta Telegram para señal de compra."""
+def _send_scalp_alert(symbol: str, sig: dict) -> bool:
+    """Formatea y manda alerta Telegram para señal de compra.
+    Returns True si el envío fue exitoso (para activar el cooldown)."""
     name    = sig["name"]
     price   = sig["price"]
     score   = sig["score"]
@@ -508,10 +534,10 @@ def _send_scalp_alert(symbol: str, sig: dict):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⏱ TF: {TF_FAST}/{TF_SLOW}  │  {datetime.now().strftime('%H:%M:%S')}"
     )
-    send_telegram(msg)
+    return send_telegram(msg)
 
 
-def _send_stock_alert(symbol: str, data: dict):
+def _send_stock_alert(symbol: str, data: dict) -> bool:
     """Formatea y manda alerta Telegram para señal STRONG BUY de acción USA."""
     name       = data["name"]
     price      = data["price"]
@@ -545,7 +571,42 @@ def _send_stock_alert(symbol: str, data: dict):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⏱ TF: 1h  │  {datetime.now().strftime('%H:%M:%S')}"
     )
-    send_telegram(msg)
+    return send_telegram(msg)
+
+
+def _format_close_msg(trade: dict) -> str:
+    """
+    Formatea el mensaje de Telegram para el CIERRE de una posición.
+    Función pura (sin red) — testeable sin mocks de red.
+
+    trade: dict generado por _close_position (entry, exit, pnl_net, result, ...).
+    Usa HTML (coincide con parse_mode de send_telegram).
+    """
+    name     = trade.get("name", trade.get("sym", "?"))
+    sym      = trade.get("sym", "")
+    is_win   = trade["result"] == "WIN"
+    icon     = "✅" if is_win else "🛑"
+    asset    = "🪙" if trade.get("type") != "stock" else "📈"
+    pnl_net  = trade["pnl_net"]
+    pnl_gr   = trade["pnl_gross"]
+    reason   = trade.get("reason", "")
+
+    return "\n".join([
+        f"{icon} <b>CIERRE {trade['result']}</b> — {asset} {name} ({sym})",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📥 <b>Entrada:</b> <code>{fmt_price(trade['entry'])}</code>",
+        f"📤 <b>Salida:</b>  <code>{fmt_price(trade['exit'])}</code>  ({reason})",
+        f"💵 <b>PnL neto:</b> <b>{pnl_net:+.2f}%</b>  "
+        f"(<i>bruto {pnl_gr:+.2f}%, costos {ROUND_TRIP_COST_PCT:.2f}%</i>)",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⏱ TF: {trade.get('tf', '─')}  │  {datetime.now().strftime('%H:%M:%S')}",
+    ])
+
+
+def _send_close_alert(trade: dict) -> None:
+    """Manda alerta Telegram al cerrar una posición (WIN o LOSS)."""
+    if trade:
+        send_telegram(_format_close_msg(trade))
 
 
 # ─── Construcción del display ─────────────────────────────────────────────────
@@ -1048,6 +1109,7 @@ def build_display() -> Group:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    _force_utf8_streams()
     console = Console()
     console.print("\n[bold cyan]🚀 Bot Scalping — iniciando...[/]")
     console.print(f"[dim]   {len(ASSETS)} activos  │  TF: {TF_FAST}/{TF_SLOW}  │  Refresh: {PRICE_INTERVAL_SEC}s[/]")

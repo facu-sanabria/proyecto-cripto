@@ -131,6 +131,13 @@ def should_notify(symbol: str) -> bool:
     return (time.time() - last) >= NOTIFY_COOLDOWN_SEC
 
 
+def mark_notified(symbol: str) -> None:
+    """Registra que se notificó este símbolo ahora (activa el cooldown).
+    Llamar tras un envío exitoso. Sin esto, should_notify nunca se enfría
+    y el mismo símbolo se re-notifica en cada ciclo (spam)."""
+    _last_notified[symbol] = time.time()
+
+
 def notify_strong_signals(results: list) -> int:
     """
     Manda notificación Telegram por cada STRONG BUY que no esté en cooldown.

@@ -47,13 +47,16 @@ def simulate_fill(df: pd.DataFrame, entry_unix: float,
     Returns:
         ("Stop-Loss", price, ts) | ("Take-Profit", price, ts) | None
 
-    Nota: en pandas 3.x, df.index.astype("int64") devuelve MICROsegundos (µs),
-    no nanosegundos. Dividir por 1_000_000 → segundos UTC.
+    Nota: la resolución de df.index.astype("int64") depende del dtype y NO es
+    fiable (crypto=[ms], stocks=[s], date_range=[us]). Por eso comparamos
+    datetime vs datetime: pd.Timestamp(entry_unix, unit="s") contra df.index.
     pd.Timestamp.value sigue siendo nanosegundos → dividir por 1_000_000_000.
     NUNCA usar pd.Timestamp.timestamp() para entry_unix — devuelve hora local.
     """
-    df_unix = df.index.astype("int64") // 1_000_000
-    post    = df[df_unix > entry_unix]
+    # Comparar datetime vs datetime — inmune a la resolución del índice
+    # (producción: crypto datetime64[ms], stocks datetime64[s]; tests: [us]).
+    entry_ts = pd.Timestamp(int(entry_unix), unit="s")
+    post     = df[df.index > entry_ts]
 
     for ts, row in post.iterrows():
         sl_hit = row["low"]  <= sl_price
@@ -266,6 +269,80 @@ class TestFillOrder:
         assert result is not None
         assert result[0] == "Stop-Loss",  f"SL ocurre antes, got {result[0]}"
         assert result[2] == df.index[1],  f"Fill debe ser en vela 1, got {result[2]}"
+
+
+def make_fill_df_with_unit(prices: list, unit: str, entry_time: datetime = None):
+    """
+    Igual que make_fill_df pero fuerza la resolución del DatetimeIndex para
+    replicar producción:
+      - crypto (fetcher.py): pd.to_datetime(ms, unit="ms") → datetime64[ms]
+      - stocks (stocks_fetcher.py): pd.to_datetime(s, unit="s") → datetime64[s]
+    make_fill_df normal usa pd.date_range → datetime64[us] (NO representa producción).
+    """
+    if entry_time is None:
+        entry_time = datetime(2024, 1, 1, 0, 0, 0)
+    base = pd.Timestamp(entry_time)
+    if unit == "ms":
+        stamps = [int(base.value // 1_000_000) + i * 5 * 60 * 1000 for i in range(len(prices))]
+    elif unit == "s":
+        stamps = [int(base.value // 1_000_000_000) + i * 5 * 60 for i in range(len(prices))]
+    else:
+        raise ValueError(unit)
+    idx   = pd.to_datetime(stamps, unit=unit)
+    close = np.array(prices, dtype=float)
+    return pd.DataFrame({
+        "open":   close,
+        "high":   close * 1.001,
+        "low":    close * 0.999,
+        "close":  close,
+        "volume": np.ones(len(prices)) * 1000,
+    }, index=idx)
+
+
+class TestProductionDtypeResolution:
+    """
+    Regresión: el índice de producción NO es datetime64[us].
+    Crypto = [ms], Stocks = [s]. El simulador debe detectar fills con cualquiera.
+    Estos tests fallan con `df.index.astype("int64") // 1_000_000` (asume µs).
+    """
+
+    @pytest.mark.parametrize("unit", ["ms", "s"])
+    def test_tp_detected_with_production_dtype(self, unit):
+        sl_price = 98.5
+        tp_price = 103.0
+        df = make_fill_df_with_unit([100.0, 103.5], unit=unit)
+        assert str(df.index.dtype) == f"datetime64[{unit}]"
+        entry_unix = ts_to_unix(df.index[0]) - 1
+
+        result = simulate_fill(df, entry_unix, sl_price, tp_price)
+        assert result is not None, f"[{unit}] debería detectar TP, no None"
+        assert result[0] == "Take-Profit", f"[{unit}] esperaba TP, got {result[0]}"
+        assert result[2] == df.index[1]
+
+    @pytest.mark.parametrize("unit", ["ms", "s"])
+    def test_sl_detected_with_production_dtype(self, unit):
+        sl_price = 98.5
+        tp_price = 103.0
+        df = make_fill_df_with_unit([100.0, 98.0], unit=unit)
+        entry_unix = ts_to_unix(df.index[0]) - 1
+
+        result = simulate_fill(df, entry_unix, sl_price, tp_price)
+        assert result is not None, f"[{unit}] debería detectar SL, no None"
+        assert result[0] == "Stop-Loss", f"[{unit}] esperaba SL, got {result[0]}"
+
+    @pytest.mark.parametrize("unit", ["ms", "s"])
+    def test_no_fill_before_entry_production_dtype(self, unit):
+        """Velas pre-entrada no deben causar fill, con dtype de producción."""
+        sl_price = 98.5
+        tp_price = 103.0
+        df = make_fill_df_with_unit(
+            [97.0, 97.5, 98.0, 98.3, 98.4,   # tocarían SL (pre-entrada)
+             100.0, 100.1, 100.2, 100.3, 100.4],  # post-entrada neutral
+            unit=unit,
+        )
+        entry_unix = ts_to_unix(df.index[4])  # entra al cierre de vela 4
+        result = simulate_fill(df, entry_unix, sl_price, tp_price)
+        assert result is None, f"[{unit}] velas pre-entrada no deben fillear, got {result}"
 
 
 class TestPnLCalculation:
